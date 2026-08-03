@@ -1,0 +1,148 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [1.7.0-perso] — 2026-07-31
+
+### Added
+
+- **Every remaining field from the Klereo API is now exposed.** A generic diagnostic sensor is created for any scalar (string/number/bool) value anywhere in the payload that isn't already surfaced by a named/curated entity — root-level fields (`status`, `jitter`, `rfSent`, `podSerial`...), all of `details["params"]` (~90 fields: `Elec_*`, `Oxy_*`, `Reg*`...), all of `details["ExtraParams"]` (~90 fields, including the nested `Debit1`/`Debit2` blocks), and `details["register"]`/`details["podinfo"]`.
+  - These are created with `entity_category: diagnostic` and **disabled by default** so they don't clutter your dashboard — enable individual ones from **Settings → Devices & services → Entities** (filter by "disabled") if you need one.
+  - On a real 2026-07 pod, this adds ~316 diagnostic sensors on top of the ~55 curated ones.
+- **New curated sections**: salt chlorinator cell telemetry (voltage, current, lifetime), pod connectivity (`pingSent`/`pongRx`/`pingFail`), system diagnostics (`lastPing`, `infosTime`, `rfSent`, `rfErr`, pump max speed setting), frost-protection level.
+- **New sensor**: "Schedule Plans" — count of programmed time-slot plans, with the base64-encoded schedule data (`plan64`) per plan as an attribute for anyone wanting to decode it further. The raw binary `plan` field is intentionally omitted (can contain non-printable characters).
+- Probe sensors now also expose `updated`, `filtered_time`, `direct_time`, `update_time`, and `calibration` (calib1-3) as attributes — every field the API sends for a probe is now available.
+- Output switches now also expose `total_time`, `off_delay`, `flags`, `map`, `clone_src`, `update_time`, `real_status`, `recur_mode`, `recur_date` as attributes — every field the API sends for an output is now available.
+- Refactored the per-section sensor classes (`KlereoParamInfoSensor`, `KlereoPumpSensor`) into a single generic `KlereoFieldSensor(source_path, field_key, meta)`, used both for curated sections and the raw fallback.
+
+### Caution
+
+- A few of the newly-exposed raw fields (`register.pin`, `register.compta`) are account/pairing identifiers rather than sensor readings. They're disabled by default like all raw fields; be mindful if you enable and then share dashboards/screenshots including them.
+
+## [1.6.0] — 2026-07-31
+
+### Fixed
+
+- **Water setpoint (`ConsigneEau`) number entity was never created on current firmware.** Writable setpoints are exposed by the Klereo API under `details["params"]` on current pods, not `details["RegulModes"]` as previously assumed — the number platform only ever looked in `RegulModes`. Confirmed against real diagnostics from a 2026-07 pod. `number.py` now checks both locations.
+- `RegulModes` key names updated to match what current firmware actually sends (`PoolMode`, `TraitMode`, `pHMode`, `HeaterMode`) instead of names assumed from the original Jeedom plugin (`ModeFiltration`, `ModeRegulPH`, ...). Both sets of names are kept in `PARAM_NAMES` for compatibility across firmware versions.
+
+### Added
+
+- **New writable setpoints**: `ConsignePH`, `ConsigneRedox`, `ConsigneChlore` are now `number` entities (previously read-only sensors, or not exposed at all).
+- **Dynamic setpoint bounds**: number entities read their installation's actual configured min/max (e.g. `pHMin`/`pHMax`) from `details["params"]` when available, instead of always using static defaults.
+- **New read-only sensors from `details["params"]`**: pool volume (`VolumeEau`), nominal pump flow (`DebitPompe`), filtration total/today runtime, pH- dosing total/today time, chlorinator total/today runtime.
+- **Variable-speed pump telemetry sensors** from `details["ExtraParams"]`: pump power (W), flow, speed (%), RPM.
+- **New `binary_sensor` platform**: "Alert Active" (`problem` device class), reporting the system's alert status even when Klereo's own `alertCount` field disagrees with the `alerts` list.
+- **New sensor**: "Active Alerts" count, with the raw alert list as an attribute.
+- Probe sensors now expose `threshold_min`/`threshold_max` (the sonde's configured alarm bounds) as attributes.
+- `DeviceInfo` now includes `sw_version` (pod firmware) and `serial_number` (`podSerial`) when available.
+
+## [1.5.1] — 2026-03-05
+
+### Added
+
+- **test_config_flow.py** — 10 tests covering `validate_input` (success, API errors, HTTP errors, timeout, password hashing) and `hash_password` utility ([#36](https://github.com/JonBasse/ha-klereo/issues/36)).
+- **test_diagnostics.py** — 3 tests covering diagnostics output structure, sensitive field redaction, and `TO_REDACT` contents ([#37](https://github.com/JonBasse/ha-klereo/issues/37)).
+- **test_number.py** — 6 tests covering `KlereoNumber` creation, initial value, `async_set_native_value`, coordinator update, availability, and device info ([#38](https://github.com/JonBasse/ha-klereo/issues/38)).
+- **test_api.py** — 6 new tests for `_request_with_retry` (transient error retry, retry exhaustion, non-401 propagation) and `_parse_response` (valid JSON, invalid JSON, HTTP errors).
+- Test suite now covers **56 tests** across 6 files (up from 31).
+
+## [1.5.0] — 2026-03-05
+
+### Changed
+
+- Extracted `hash_password()` helper in `const.py` — replaces 3 duplicated SHA-1 hashing call sites ([#29](https://github.com/JonBasse/ha-klereo/issues/29)).
+- Moved API wire constants (`API_URL_*`, `OUT_MODE_*`, `OUT_STATE_*`, `API_VERSION`, `API_COM_MODE`) from `const.py` to `api.py` where they belong ([#43](https://github.com/JonBasse/ha-klereo/issues/43)).
+- Extracted `setup_discovery()` helper in `entity.py` — replaces triplicated discovery boilerplate across sensor, switch, and number platforms ([#31](https://github.com/JonBasse/ha-klereo/issues/31)).
+- Config entry migration now uses HA's formal `async_migrate_entry` with `VERSION = 2` instead of inline migration in `async_setup_entry` ([#32](https://github.com/JonBasse/ha-klereo/issues/32)).
+
+## [1.4.0] — 2026-03-05
+
+### Fixed
+
+- Entities now correctly become **unavailable** when their data disappears from the API (all entity types) ([#34](https://github.com/JonBasse/ha-klereo/issues/34)).
+- `SensorStateClass.MEASUREMENT` is now applied per probe type — Cover Position and Generic sensors no longer produce misleading long-term statistics ([#26](https://github.com/JonBasse/ha-klereo/issues/26)).
+- `KlereoParamSensor` now shows human-readable names (e.g. "Filtration Mode") instead of raw API keys ([#27](https://github.com/JonBasse/ha-klereo/issues/27)).
+- `KlereoParamSensor` no longer applies `state_class: MEASUREMENT` indiscriminately.
+
+### Changed
+
+- Switch and number commands now route through `KlereoCoordinator` methods (`async_set_output`, `async_set_param`) instead of calling the API client directly — centralizes error handling and post-command refresh ([#30](https://github.com/JonBasse/ha-klereo/issues/30)).
+
+## [1.3.1] — 2026-03-05
+
+### Fixed
+
+- Removed broad `except Exception` in coordinator that swallowed programming errors — unexpected exceptions now propagate with full tracebacks ([#46](https://github.com/JonBasse/ha-klereo/issues/46)).
+- Guarded `int(status)` in switch against `ValueError` for non-numeric API responses — logs a warning and defaults to off ([#25](https://github.com/JonBasse/ha-klereo/issues/25)).
+- Excluded `PARAM_TYPES` keys from sensor discovery to prevent duplicate entities (e.g. `ConsigneEau` appearing as both sensor and number) ([#28](https://github.com/JonBasse/ha-klereo/issues/28)).
+- Fixed early return in `_handle_coordinator_update` for `KlereoParamSensor` and `KlereoNumber` — entities now correctly become unavailable when their system disappears from the API instead of keeping stale state ([#24](https://github.com/JonBasse/ha-klereo/issues/24)).
+
+## [1.3.0] — 2026-02-23
+
+### Added
+
+- **Number entities** — Water temperature setpoint (`ConsigneEau`) as an adjustable number entity (10–40 °C).
+- **Diagnostics platform** — Download redacted diagnostic data for troubleshooting.
+- **Re-authentication flow** — Expired credentials prompt re-entry instead of requiring removal.
+- **Configurable scan interval** — Options flow to set polling interval (1–60 minutes).
+- **Dynamic entity discovery** — New probes/outputs are added automatically without restart.
+- **CI/CD pipeline** — GitHub Actions for linting (ruff), testing (pytest), and HACS validation.
+- **Test suite** — 31 tests covering API client, coordinator, sensors, and switches.
+- **KlereoCoordinator** — Dedicated coordinator subclass with parallel API fetching.
+- **KlereoEntity base class** — Shared base with DeviceInfo and `has_entity_name`.
+- **Type annotations** — Added throughout the codebase.
+
+### Fixed
+
+- Switch status comparison now handles string values from the API (`"1"` / `"0"`).
+- `KlereoApiError` (JSON parse errors) no longer incorrectly triggers re-authentication.
+- `device_info` uses safe `.get()` to prevent `KeyError` on partial API data.
+- `KlereoParamSensor` now has `state_class` for long-term statistics support.
+- Narrowed bare `except Exception` to specific error types.
+- Normalized config entry `unique_id` to prevent duplicate entries.
+
+### Security
+
+- Credentials stored as SHA-1 hash instead of plaintext, with automatic migration.
+- `firebase-debug.log` removed from repository.
+- Diagnostics redacts sensitive data from both config entry and coordinator data.
+
+### Changed
+
+- Minimum Home Assistant version bumped to **2024.4** (from 2024.1).
+- API client uses `asyncio.Lock` for re-authentication to prevent concurrent login storms.
+- API client retries on transient errors (`ClientConnectionError`, `TimeoutError`) with 2s backoff.
+- Switch commands wrapped with `HomeAssistantError` and use optimistic state updates.
+- O(1) entity lookup via index dicts instead of linear scans.
+- Extracted `_parse_response` helper to DRY up JSON parsing in API client.
+
+## [1.2.0] — 2026-02-02
+
+### Fixed
+
+- Fixed broken switch commands — API parameter names were wrong.
+- Fixed switch mode value — was sending mode=1 (Time Slots) instead of mode=0 (Manual).
+- Fixed stale entities — sensors and switches never updated after initial load.
+- Fixed sensor type mapping — types 1 (Air Temp) and 5 (Water Temp) were swapped.
+
+### Added
+
+- Proper error differentiation in config flow (`CannotConnect` vs `InvalidAuth`).
+- Unique ID on config entries to prevent duplicate setups.
+- Named constants for output modes and states.
+- `SensorStateClass.MEASUREMENT` for long-term statistics.
+- Config flow translations.
+
+### Removed
+
+- Dead `binary_sensor.py` that never created entities.
+
+## [1.1.0] — Initial HACS Release
+
+### Added
+
+- Probe sensors for water quality monitoring.
+- Output switches for pool equipment control.
+- Regulation parameter sensors.
+- Config flow for credential setup.
