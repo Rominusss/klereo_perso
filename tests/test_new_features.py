@@ -1,4 +1,6 @@
-"""Tests for the params-based setpoints, pump telemetry, and alert sensors."""
+"""Tests for params-based setpoints, generic field sensors, and the raw
+diagnostic fallback that surfaces every remaining scalar field from the
+Klereo API."""
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,8 +9,8 @@ from custom_components.klereo_perso.binary_sensor import KlereoAlertBinarySensor
 from custom_components.klereo_perso.number import KlereoNumber, _extract_numbers
 from custom_components.klereo_perso.sensor import (
     KlereoAlertCountSensor,
-    KlereoParamInfoSensor,
-    KlereoPumpSensor,
+    KlereoFieldSensor,
+    KlereoSchedulePlansSensor,
     _extract_sensors,
 )
 
@@ -31,18 +33,29 @@ REAL_WORLD_DETAILS = {
         "DebitPompe": 11,
         "Filtration_TotalTime": 81907,
         "Filtration_TodayTime": 38339,
+        "Elec_Throttle": 100,  # not curated -> should surface via raw fallback
     },
     "ExtraParams": {
         "PmpWatts": 244,
         "PmpFlow": 8,
         "PmpSpeed": 60,
         "PmpRPM": 0,
+        "CellVoltage": 0,
+        "CellIntensity": 0,
+        "Debit1": {"CfgDeb1": 6722, "SecVolume1": 5},
+        "AqOnOff": 0,  # not curated -> raw fallback
     },
+    "register": {"pin": "0301-5854438-4933", "proID": 4933, "lastUpdate": 1777023317},
+    "podinfo": {"app": 296, "pingSent": 2531, "pongRx": 2545, "pingFail": 4},
     "probes": [],
     "outs": [],
+    "lastPing": 13,
+    "HorsGel": 3,
+    "status": 135006226,  # not curated -> raw fallback
     "alertCount": 0,
     "notifyCount": 1,
     "alerts": [{"index": 0, "code": 45, "param": 3, "level": 2}],
+    "plans": [{"index": 0, "plan": "\x00\x00", "plan64": "AAA=", "updateTime": 149}],
 }
 
 
@@ -93,35 +106,101 @@ class TestParamsBasedSetpoints:
         assert number._attr_native_value == 30
 
 
-class TestParamInfoSensors:
-    """Read-only informational sensors from details['params']."""
+class TestKlereoFieldSensor:
+    """The generic, path-based field sensor used for all curated sub-sections."""
 
-    def test_extract_sensors_includes_param_info(self, mock_coordinator):
-        details = mock_coordinator.data["SYS1"]["details"]
-        items = _extract_sensors(mock_coordinator, "SYS1", details)
-        keys = {uid for uid, _ in items}
-        assert "SYS1_paraminfo_VolumeEau" in keys
-        assert "SYS1_paraminfo_Filtration_TotalTime" in keys
-
-    def test_param_info_sensor_value(self, mock_coordinator):
-        sensor = KlereoParamInfoSensor(mock_coordinator, "SYS1", "VolumeEau")
+    def test_reads_from_params(self, mock_coordinator):
+        sensor = KlereoFieldSensor(
+            mock_coordinator, "SYS1", ("params",), "VolumeEau",
+            {"name": "Pool Volume", "unit": "m³"}, "SYS1_paraminfo_VolumeEau",
+        )
         assert sensor._attr_native_value == 44
         assert sensor._attr_name == "Pool Volume"
 
+    def test_reads_from_nested_extraparams_path(self, mock_coordinator):
+        """Should be able to descend two levels (ExtraParams -> Debit1)."""
+        sensor = KlereoFieldSensor(
+            mock_coordinator, "SYS1", ("ExtraParams", "Debit1"), "CfgDeb1",
+            {"name": "Debit1 CfgDeb1", "unit": None}, "SYS1_raw_extra_debit1_CfgDeb1",
+        )
+        assert sensor._attr_native_value == 6722
 
-class TestPumpTelemetrySensors:
-    """Variable-speed pump telemetry from details['ExtraParams']."""
+    def test_diagnostic_flag_sets_entity_category_and_disabled_default(self, mock_coordinator):
+        sensor = KlereoFieldSensor(
+            mock_coordinator, "SYS1", ("params",), "Elec_Throttle",
+            {"name": "Raw: Elec Throttle", "unit": None, "diagnostic": True},
+            "SYS1_raw_params_Elec_Throttle",
+        )
+        assert sensor._attr_entity_registry_enabled_default is False
+        assert sensor._attr_entity_category is not None
 
-    def test_extract_sensors_includes_pump_telemetry(self, mock_coordinator):
+    def test_becomes_unavailable_when_system_disappears(self, mock_coordinator):
+        sensor = KlereoFieldSensor(
+            mock_coordinator, "MISSING", ("params",), "VolumeEau",
+            {"name": "Pool Volume", "unit": "m³"}, "MISSING_paraminfo_VolumeEau",
+        )
+        sensor._handle_coordinator_update()
+        assert sensor._attr_available is False
+
+
+class TestRawFallback:
+    """The generic raw fallback that surfaces every remaining scalar field."""
+
+    def test_extract_sensors_includes_uncurated_params_field(self, mock_coordinator):
         details = mock_coordinator.data["SYS1"]["details"]
         items = _extract_sensors(mock_coordinator, "SYS1", details)
         keys = {uid for uid, _ in items}
-        assert "SYS1_pump_PmpWatts" in keys
+        assert "SYS1_raw_params_Elec_Throttle" in keys
 
-    def test_pump_sensor_value(self, mock_coordinator):
-        sensor = KlereoPumpSensor(mock_coordinator, "SYS1", "PmpWatts")
-        assert sensor._attr_native_value == 244
-        assert sensor._attr_device_class == "power"
+    def test_extract_sensors_includes_uncurated_root_field(self, mock_coordinator):
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = {uid for uid, _ in items}
+        assert "SYS1_raw_root_status" in keys
+
+    def test_extract_sensors_includes_nested_extraparams_dict(self, mock_coordinator):
+        """Debit1 is a nested dict inside ExtraParams -> flattened with a prefix."""
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = {uid for uid, _ in items}
+        assert "SYS1_raw_extra_debit1_CfgDeb1" in keys
+
+    def test_extract_sensors_includes_register_fields(self, mock_coordinator):
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = {uid for uid, _ in items}
+        assert "SYS1_raw_register_pin" in keys
+
+    def test_no_duplicate_entities_for_curated_fields(self, mock_coordinator):
+        """A field curated elsewhere (e.g. PmpWatts) must not also appear as raw."""
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = [uid for uid, _ in items]
+        assert keys.count("SYS1_pump_PmpWatts") == 1
+        assert "SYS1_raw_extra_PmpWatts" not in keys
+
+    def test_no_duplicate_uids_at_all(self, mock_coordinator):
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = [uid for uid, _ in items]
+        assert len(keys) == len(set(keys))
+
+
+class TestSchedulePlansSensor:
+    """Schedule plan count + safe (plan64-only) attribute list."""
+
+    def test_extract_sensors_includes_schedule_plans(self, mock_coordinator):
+        details = mock_coordinator.data["SYS1"]["details"]
+        items = _extract_sensors(mock_coordinator, "SYS1", details)
+        keys = {uid for uid, _ in items}
+        assert "SYS1_schedule_plans" in keys
+
+    def test_value_is_plan_count_and_raw_binary_omitted(self, mock_coordinator):
+        sensor = KlereoSchedulePlansSensor(mock_coordinator, "SYS1")
+        assert sensor._attr_native_value == 1
+        plan_attr = sensor._attr_extra_state_attributes["plans"][0]
+        assert plan_attr["plan64"] == "AAA="
+        assert "plan" not in plan_attr
 
 
 class TestAlertSensors:
@@ -138,11 +217,7 @@ class TestAlertSensors:
         assert sensor._attr_extra_state_attributes["alerts"] == REAL_WORLD_DETAILS["alerts"]
 
     def test_binary_sensor_on_when_alerts_present_despite_zero_count(self, mock_coordinator):
-        """alertCount=0 but a real alert is present in 'alerts' -> should be ON.
-
-        This mirrors real-world data where Klereo's own alertCount and the
-        alerts list can disagree.
-        """
+        """alertCount=0 but a real alert is present in 'alerts' -> should be ON."""
         binary_sensor = KlereoAlertBinarySensor(mock_coordinator, "SYS1")
         assert binary_sensor._attr_is_on is True
 

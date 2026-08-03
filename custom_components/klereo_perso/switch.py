@@ -73,6 +73,15 @@ class KlereoSwitch(KlereoEntity, SwitchEntity):
         self._attr_extra_state_attributes = {
             "mode": data.get("mode"),
             "type": data.get("type"),
+            "total_time": data.get("totalTime"),
+            "off_delay": data.get("offDelay"),
+            "flags": data.get("flags"),
+            "map": data.get("map"),
+            "clone_src": data.get("cloneSrc"),
+            "update_time": data.get("updateTime"),
+            "real_status": data.get("realStatus"),
+            "recur_mode": data.get("recurMode"),
+            "recur_date": data.get("recurDate"),
         }
 
     def _find_my_data(self):

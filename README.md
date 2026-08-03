@@ -6,8 +6,15 @@ Fork personnel de [ha-klereo](https://github.com/JonBasse/ha-klereo) par JonBass
 
 - **Correctif** : sur le firmware actuel, les consignes réglables (température, pH, redox, chlore) sont exposées par l'API Klereo sous `details["params"]`, pas sous `details["RegulModes"]` comme le suppose l'intégration d'origine. Résultat : la consigne d'eau (`ConsigneEau`) n'était jamais créée en entité `number`. Ce fork lit les deux emplacements.
 - **Nouvelles entités** : consignes pH/redox/chlore réglables, bornes min/max dynamiques par installation, sensors de volume/débit/temps de fonctionnement, télémétrie pompe à vitesse variable, capteur d'alerte active (`binary_sensor`, classe `problem`).
+- **Toutes les données de l'API** : depuis la v1.7.0-perso, chaque champ restant renvoyé par l'API Klereo (~300 champs bruts) est exposé en `sensor` de diagnostic, désactivé par défaut. Rien n'est perdu, même les champs dont on ne connaît pas encore la signification exacte.
 
 Voir `CHANGELOG.md` pour le détail complet.
+
+## Entités "diagnostic" désactivées par défaut
+
+Une installation typique génère environ 55 entités curatées (activées) + ~300 entités brutes de diagnostic (désactivées). Pour activer une entité brute qui vous intéresse :
+
+**Paramètres → Appareils et services → Klereo (perso) → cliquez sur l'appareil → onglet Entités → cochez "Afficher les entités désactivées"** → cliquez sur l'entité voulue → activez-la (roue crantée en haut à droite du dialogue) → redémarrez si demandé.
 
 ## Installation via HACS (dépôt personnalisé)
 

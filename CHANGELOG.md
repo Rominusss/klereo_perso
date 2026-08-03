@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.0-perso] — 2026-07-31
+
+### Added
+
+- **Every remaining field from the Klereo API is now exposed.** A generic diagnostic sensor is created for any scalar (string/number/bool) value anywhere in the payload that isn't already surfaced by a named/curated entity — root-level fields (`status`, `jitter`, `rfSent`, `podSerial`...), all of `details["params"]` (~90 fields: `Elec_*`, `Oxy_*`, `Reg*`...), all of `details["ExtraParams"]` (~90 fields, including the nested `Debit1`/`Debit2` blocks), and `details["register"]`/`details["podinfo"]`.
+  - These are created with `entity_category: diagnostic` and **disabled by default** so they don't clutter your dashboard — enable individual ones from **Settings → Devices & services → Entities** (filter by "disabled") if you need one.
+  - On a real 2026-07 pod, this adds ~316 diagnostic sensors on top of the ~55 curated ones.
+- **New curated sections**: salt chlorinator cell telemetry (voltage, current, lifetime), pod connectivity (`pingSent`/`pongRx`/`pingFail`), system diagnostics (`lastPing`, `infosTime`, `rfSent`, `rfErr`, pump max speed setting), frost-protection level.
+- **New sensor**: "Schedule Plans" — count of programmed time-slot plans, with the base64-encoded schedule data (`plan64`) per plan as an attribute for anyone wanting to decode it further. The raw binary `plan` field is intentionally omitted (can contain non-printable characters).
+- Probe sensors now also expose `updated`, `filtered_time`, `direct_time`, `update_time`, and `calibration` (calib1-3) as attributes — every field the API sends for a probe is now available.
+- Output switches now also expose `total_time`, `off_delay`, `flags`, `map`, `clone_src`, `update_time`, `real_status`, `recur_mode`, `recur_date` as attributes — every field the API sends for an output is now available.
+- Refactored the per-section sensor classes (`KlereoParamInfoSensor`, `KlereoPumpSensor`) into a single generic `KlereoFieldSensor(source_path, field_key, meta)`, used both for curated sections and the raw fallback.
+
+### Caution
+
+- A few of the newly-exposed raw fields (`register.pin`, `register.compta`) are account/pairing identifiers rather than sensor readings. They're disabled by default like all raw fields; be mindful if you enable and then share dashboards/screenshots including them.
+
 ## [1.6.0] — 2026-07-31
 
 ### Fixed
