@@ -1,27 +1,29 @@
 """Binary sensor platform for Klereo."""
 import logging
 
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
-)
+from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import BINARY_SENSOR_TYPES
 from .entity import KlereoEntity, setup_discovery
+from .models import KlereoPoolDetails, KlereoProbe
+from .perso import extract_perso_binary_sensors  # perso layer
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _extract_binary_sensors(coordinator, system_id, details):
+def _extract_binary_sensors(coordinator, system_id, details: KlereoPoolDetails):
     """Extract binary sensors from system details."""
     items = []
-    # Created whenever the system reports alert-related fields at all,
-    # regardless of whether there is currently an active alert.
-    if "alertCount" in details or "alerts" in details:
-        uid = f"{system_id}_alert_active"
-        items.append((uid, KlereoAlertBinarySensor(coordinator, system_id)))
+    for probe in details.probes:
+        if probe.type not in BINARY_SENSOR_TYPES:
+            continue
+        uid = f"{system_id}_binary_sensor_{probe.index}"
+        items.append((uid, KlereoBinarySensor(coordinator, system_id, probe)))
+    # Perso layer: "Alert Active" problem sensor.
+    items.extend(extract_perso_binary_sensors(coordinator, system_id))
     return items
 
 
@@ -34,42 +36,50 @@ async def async_setup_entry(
     setup_discovery(hass, entry, async_add_entities, _extract_binary_sensors)
 
 
-class KlereoAlertBinarySensor(KlereoEntity, BinarySensorEntity):
-    """Whether the Klereo system currently reports an active alert.
+class KlereoBinarySensor(KlereoEntity, BinarySensorEntity):
+    """Representation of a Klereo binary probe sensor."""
 
-    Klereo's own "alertCount" field and the length of the "alerts" list can
-    disagree in practice (e.g. alertCount=0 while an unacknowledged alert is
-    still present in "alerts"). To avoid missing a real problem, this sensor
-    considers an alert active if *either* signal indicates one.
-    """
-
-    _attr_device_class = BinarySensorDeviceClass.PROBLEM
-
-    def __init__(self, coordinator, system_id):
-        """Initialize the alert binary sensor."""
+    def __init__(self, coordinator, system_id, probe: KlereoProbe):
+        """Initialize the binary sensor."""
         super().__init__(coordinator, system_id)
-        self._attr_unique_id = f"{system_id}_alert_active"
-        self._attr_name = "Alert Active"
-        self._update_from_data(coordinator.data.get(system_id, {}).get("details", {}))
+        self._index = probe.index
+        self._type = probe.type
+
+        sensor_def = BINARY_SENSOR_TYPES.get(self._type, {})
+
+        self._attr_unique_id = f"{system_id}_binary_sensor_{self._index}"
+        self._attr_name = sensor_def.get("name", f"Sensor {self._index}")
+        self._attr_device_class = sensor_def.get("device_class")
+
+        self._update_from_probe(probe)
+
+    @property
+    def available(self) -> bool:
+        """Return False once the payload stops carrying this probe.
+
+        Narrows the base property, which only checks the system. A probe that vanishes
+        used to leave the entity pinned to its last reading forever (#130).
+        """
+        return super().available and self._find_my_probe() is not None
 
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
-            return super()._handle_coordinator_update()
-        self._attr_available = True
-        details = self.coordinator.data[self.system_id].get("details", {})
-        self._update_from_data(details)
+        probe = self._find_my_probe()
+        if probe:
+            self._update_from_probe(probe)
         super()._handle_coordinator_update()
 
-    def _update_from_data(self, details):
-        """Update state from the system's alert data."""
-        alerts = details.get("alerts", [])
-        alert_count = details.get("alertCount", 0)
-        self._attr_is_on = bool(alert_count) or bool(alerts)
-        self._attr_extra_state_attributes = {
-            "alert_count": alert_count,
-            "notify_count": details.get("notifyCount"),
-            "alerts": alerts,
-        }
+    def _update_from_probe(self, probe: KlereoProbe):
+        """Update state from probe data."""
+        value = probe.filtered_value
+        if value is None:
+            value = probe.direct_value
+        self._attr_is_on = bool(value) if value is not None else None
+
+    def _find_my_probe(self) -> KlereoProbe | None:
+        """Find this probe's data in the coordinator data."""
+        system = self.coordinator.data.get(self.system_id)
+        if system is None:
+            return None
+        return system.details.probe_index.get(self._index)

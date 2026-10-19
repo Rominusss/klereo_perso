@@ -5,23 +5,30 @@
                 "title": "Klereo Connect",
                 "description": "Enter your Klereo Connect credentials.",
                 "data": {
-                    "username": "Email",
+                    "username": "Klereo username",
                     "password": "Password"
+                },
+                "data_description": {
+                    "username": "Your Klereo Connect **username** — not your e-mail address. The Klereo app accepts either at sign-in, but this API only matches the username, and an e-mail address authenticates successfully and then returns no pools at all."
                 }
             },
             "reauth_confirm": {
                 "title": "Re-authenticate Klereo",
                 "description": "Your Klereo credentials have expired. Please re-enter them.",
                 "data": {
-                    "username": "Email",
+                    "username": "Klereo username",
                     "password": "Password"
+                },
+                "data_description": {
+                    "username": "Your Klereo Connect **username** — not your e-mail address. The Klereo app accepts either at sign-in, but this API only matches the username, and an e-mail address authenticates successfully and then returns no pools at all."
                 }
             }
         },
         "error": {
             "cannot_connect": "Unable to connect to the Klereo API. Check your network connection.",
-            "invalid_auth": "Invalid username or password.",
-            "unknown": "An unexpected error occurred."
+            "invalid_auth": "Invalid username or password. If you entered your e-mail address, try your Klereo username instead.",
+            "unknown": "An unexpected error occurred.",
+            "no_pools": "Your credentials were accepted, but no pool is attached to that account. This almost always means an e-mail address was entered where the Klereo **username** is required — the login succeeds either way, but only the username matches a pool."
         },
         "abort": {
             "already_configured": "This account is already configured.",
@@ -33,7 +40,20 @@
             "init": {
                 "title": "Klereo Options",
                 "data": {
-                    "scan_interval": "Update interval (minutes)"
+                    "scan_interval": "Update interval (minutes)",
+                    "power_Filtration": "Filtration pump power (W)",
+                    "power_PHMinus": "pH- dosing pump power (W)",
+                    "power_ElectroChlore": "Liquid chlorine pump power (W)",
+                    "power_HybChl": "Hybrid chlorine pump power (W)",
+                    "power_Chauff": "Heating power (W)"
+                },
+                "data_description": {
+                    "scan_interval": "How often to poll the Klereo cloud. Klereo refreshes its servers every 10 minutes and asks that clients do not poll faster, so 10 is both the default and the minimum: a shorter interval returns the same data and risks your account being banned.",
+                    "power_Filtration": "Rated power of your filtration pump, in watts. Klereo sends no power reading, so this figure is yours: take it from the equipment's rating plate, or measure it. Leave it empty and no filtration energy sensor is created — an invented default would put a credible kWh figure in your Energy dashboard.",
+                    "power_PHMinus": "Rated power of your pH- dosing pump, in watts. Yours to supply — Klereo sends no power reading. Leave it empty and no pH- energy sensor is created.",
+                    "power_ElectroChlore": "Rated power of your liquid chlorine pump, in watts. Yours to supply — Klereo sends no power reading. Leave it empty and no chlorine energy sensor is created.",
+                    "power_HybChl": "Rated power of your hybrid chlorine pump, in watts. Yours to supply — Klereo sends no power reading. Leave it empty and no chlorine energy sensor is created.",
+                    "power_Chauff": "Rated power of your heater or heat pump, in watts. Yours to supply — Klereo sends no power reading. Leave it empty and no heating energy sensor is created. A constant power approximates an on/off heater well; an inverter heat pump modulates, so the figure will be an upper bound."
                 }
             }
         }

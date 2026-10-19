@@ -9,8 +9,15 @@ from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import KlereoApi, KlereoApiError
-from .const import DOMAIN, SCAN_INTERVAL_MINUTES, hash_password
+from .api import KlereoApi, KlereoApiError, extract_system_list
+from .const import (
+    COUNTER_EQUIPMENT,
+    DOMAIN,
+    SCAN_INTERVAL_MIN_MINUTES,
+    SCAN_INTERVAL_MINUTES,
+    hash_password,
+    power_option_key,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +45,24 @@ async def validate_input(hass: core.HomeAssistant, data: dict) -> dict:
         raise CannotConnect from err
     except (aiohttp.ClientError, TimeoutError) as err:
         raise CannotConnect from err
+
+    # 🔴 Authentication is not the question the user is asking. GitHub #56: an e-mail
+    # address LOGS IN and then matches no pool, so the flow declared success, created the
+    # entry, and left the reporter with an integration carrying zero entities and no error
+    # anywhere to explain it. He diagnosed it himself and told us the cause; nobody had
+    # given the flow an arm that could have said it.
+    #
+    # ⚠️ This is deliberately checked HERE and not left to the coordinator. By the time
+    # the first refresh runs, the entry exists and the flow has already reported success —
+    # an empty refresh there is a transient, and treating it as fatal would tear down
+    # working installations whenever Klereo answers slowly.
+    try:
+        systems = extract_system_list(await api.get_systems())
+    except (KlereoApiError, aiohttp.ClientError, TimeoutError) as err:
+        raise CannotConnect from err
+
+    if not systems:
+        raise NoPoolsFound
 
     return {"title": data[CONF_USERNAME]}
 
@@ -73,6 +98,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except NoPoolsFound:
+                errors["base"] = "no_pools"
             except Exception:
                 _LOGGER.exception("Unexpected exception during Klereo setup")
                 errors["base"] = "unknown"
@@ -109,6 +136,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except NoPoolsFound:
+                errors["base"] = "no_pools"
             except Exception:
                 _LOGGER.exception("Unexpected exception during Klereo reauth")
                 errors["base"] = "unknown"
@@ -126,6 +155,38 @@ class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""
 
 
+class NoPoolsFound(HomeAssistantError):
+    """Credentials were accepted and matched no pool.
+
+    Distinct from `InvalidAuth` on purpose: the password was right. Collapsing the two
+    would send the reporter of GitHub #56 back to check a password that was never wrong.
+    """
+
+
+def options_schema(current: int, options: dict | None = None) -> vol.Schema:
+    """Build the options form schema, pre-filled with `current` and with `options`.
+
+    🔴 The power fields carry a `suggested_value` and NO `default`. The difference is the
+    whole feature: a default writes a watt into the entry for every equipment the moment
+    the form is submitted, so `sensor` would then be metering our number rather than the
+    user's, for hardware they never declared. With a suggested value, a field left blank
+    is simply absent from `user_input` — which is also how an energy entity is removed
+    again. See #163, and `configured_power` in `entity.py` for the other end.
+    """
+    options = options or {}
+    schema = {
+        vol.Optional("scan_interval", default=current): vol.All(
+            int, vol.Range(min=SCAN_INTERVAL_MIN_MINUTES, max=60)
+        ),
+    }
+    for equipment in COUNTER_EQUIPMENT:
+        key = power_option_key(equipment)
+        schema[
+            vol.Optional(key, description={"suggested_value": options.get(key)})
+        ] = vol.All(vol.Coerce(float), vol.Range(min=0))
+    return vol.Schema(schema)
+
+
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle Klereo options."""
 
@@ -136,14 +197,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        "scan_interval",
-                        default=self.config_entry.options.get(
-                            "scan_interval", SCAN_INTERVAL_MINUTES
-                        ),
-                    ): vol.All(int, vol.Range(min=1, max=60)),
-                }
+            data_schema=options_schema(
+                current=self.config_entry.options.get("scan_interval", SCAN_INTERVAL_MINUTES),
+                options=self.config_entry.options,
             ),
         )

@@ -2,13 +2,13 @@
     "domain": "klereo_perso",
     "name": "Klereo (perso)",
     "codeowners": [
-        "@JonBasse"
+        "@Rominusss"
     ],
     "config_flow": true,
     "dependencies": [],
-    "documentation": "https://github.com/JonBasse/ha-klereo",
+    "documentation": "https://github.com/Rominusss/klereo_perso",
     "iot_class": "cloud_polling",
-    "issue_tracker": "https://github.com/JonBasse/ha-klereo/issues",
+    "issue_tracker": "https://github.com/Rominusss/klereo_perso/issues",
     "requirements": [],
-    "version": "1.8.0-perso"
+    "version": "2.0.0"
 }

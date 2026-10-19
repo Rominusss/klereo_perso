@@ -15,22 +15,209 @@ API_URL_GET_INDEX = f"{API_URL_BASE}/GetIndex.php"
 API_URL_GET_POOL_DETAILS = f"{API_URL_BASE}/GetPoolDetails.php"
 API_URL_SET_OUT = f"{API_URL_BASE}/SetOut.php"
 API_URL_SET_PARAM = f"{API_URL_BASE}/SetParam.php"
+API_URL_SET_AUTO_OFF = f"{API_URL_BASE}/SetAutoOff.php"
+API_URL_COMMAND_STATUS = f"{API_URL_BASE}/CommandStatus.php"
 
 API_VERSION = "393-J"
 API_COM_MODE = 1
 
+# Klereo writes are a TWO-step protocol, not one: `SetOut` / `SetParam` only *queue* the
+# command and return a cmdID immediately; a second call reports what actually happened.
+# An HTTP 200 on the first step therefore says nothing about execution.
+#
+# Klereo documents TWO routes for that second call (`docs/klereo-api.md`):
+#
+#   * `WaitCommand.php`   — waits for the end of execution (BLOCKING)
+#   * `CommandStatus.php` — returns immediately (what we use)
+#
+# We use the non-blocking one and poll. The reporter of GitHub #58 measured the real
+# latency at 1 to 2 seconds from `SetOut` to `status: 9`, consistently, which leaves the
+# blocking route nothing to buy — it only held a user-facing service call open for the
+# whole client timeout.
+#
+# 🔴 The two halves are inseparable. `CommandStatus` returning immediately means a SINGLE
+# call lands on `CMD_STATUS_IN_FLIGHT` almost every time; switching the route without the
+# poll in `KlereoCoordinator._async_confirm_command` would report every write as
+# unconfirmed, silently, and it would look like a success. See #140.
+# Codes from Klereo's own API documentation, relayed by the reporter of GitHub #58.
+CMD_STATUS_PENDING = 0
+CMD_STATUS_RUNNING = 1
+CMD_STATUS_OK = 9
+
+# Statuses that are not yet a verdict: the command is still on its way.
+CMD_STATUS_IN_FLIGHT = frozenset({CMD_STATUS_PENDING, CMD_STATUS_RUNNING})
+
+CMD_STATUS_LABELS = {
+    CMD_STATUS_PENDING: "pending",
+    CMD_STATUS_RUNNING: "running",
+    CMD_STATUS_OK: "executed successfully",
+    10: "command failed",
+    11: "bad parameters",
+    12: "unknown command",
+    13: "insufficient rights",
+    15: "execution timeout",
+    16: "aborted",
+    17: "pool not connected",
+    18: "service unavailable",
+    19: "box firmware too old",
+}
+
+CMD_POLL_ATTEMPTS = 10
+CMD_POLL_INTERVAL_SECONDS = 0.5
+
 TIMEOUT = 10
 USER_AGENT = "Jeedom plugin"
 
-# Output modes (from Jeedom plugin _OUT_MODE_* constants)
+# Output modes. Klereo's API documentation lists ten (`docs/klereo-api.md`); the upstream
+# plugin, written independently, validates exactly {0,1,2,3,4,6,8,9} for writes
+# (klereo.class.php l.1198) — the same ten minus 5 and 7, which the documentation marks
+# "USAGE INTERNE !! Ne pas utiliser". Two sources agreeing on that precise exclusion is
+# what allowed this table to be widened without measuring the live API (#105).
+# Only the eight writable ones are named and labelled: 5 and 7 are deliberately absent, so
+# they resolve to no label rather than to a wrong one.
 OUT_MODE_MAN = 0
 OUT_MODE_TIME_SLOTS = 1
 OUT_MODE_TIMER = 2
 OUT_MODE_REGUL = 3
+OUT_MODE_FILTRATION_SYNC = 4
+OUT_MODE_MAINTENANCE = 6
+OUT_MODE_PULSE = 8
+# "Automate" upstream and in the documentation — a PLC-driven mode, not the AUTO *state*.
+OUT_MODE_AUTOMATIC = 9
 
 # Output states (from Jeedom plugin _OUT_STATE_* constants)
 OUT_STATE_OFF = 0
 OUT_STATE_ON = 1
+# Any mode other than Manual reports and expects AUTO rather than ON/OFF.
+OUT_STATE_AUTO = 2
+
+# Output 4 (Heating) overloads newMode: it carries the KlereoTherm mode, not
+# the output mode. Sending OUT_MODE_MAN (0) there means "Off".
+# Source: Jeedom plugin klereo.class.php, _HEAT_MODE_* (l.1377-1380) and the
+# `elseif ($outIndex === 4)` branch (l.1525+).
+OUT_IDX_HEATING = 4
+
+# Output 1 is always Filtration — the index table in `docs/klereo-api.md` § *Changer le
+# mode ... d'une sortie* is fixed across installations, the same way OUT_IDX_HEATING (4)
+# is. Named here because the variable-speed pump handling below applies to this output
+# specifically.
+OUT_IDX_FILTRATION = 1
+
+# A variable-speed ("analogue") Filtration pump does not use a fixed handful of `newState`
+# values the way every other output does. Source: upstream Jeedom plugin
+# `klereo.class.php` — `if ($details['PumpMaxSpeed'] > 1) { // Analogic pump` (l.632, 912,
+# 1429) gates a `numeric`/`slider` control bounded `0..PumpMaxSpeed` (l.913-914) whose
+# value is sent verbatim as `newState` under `newMode=Manual` (l.1493-1495, 1511-1513).
+#
+# `PumpMaxSpeed` is a top-level field of `GetPoolDetails`, read into
+# `KlereoPoolDetails.pump_max_speed` — per-installation, not a fixed "1/2/3" menu.
+# ✅ Confirmed on six diagnostics exports from one reporter's installation
+# (`PumpMaxSpeed: 3` throughout); an earlier draft hardcoded three named speeds after
+# kouakattak/Klereo_HA (https://github.com/kouakattak/Klereo_HA), superseded once the
+# upstream mechanism above was found. See `number.KlereoPumpSpeedNumber`, the only
+# reader of the entity.
+#
+# `pump_max_speed > 1` (`models.KlereoPoolDetails.is_analogue_pump`, the single source of
+# truth for this comparison) gates every place this output is treated differently from a
+# plain ON/OFF relay, not just the number entity — a fixed-speed pump (the field absent or
+# `<= 1`) keeps the exact ORIGINAL behaviour everywhere, unchanged:
+#   - `switch.KlereoSwitch` / `select.KlereoOutputModeSelect`, through the shared
+#     `entity.KlereoEntity._is_analogue_pump` — without it, Manual falls back to plain
+#     ON/OFF and Regulation falls back to the general `status == OUT_STATE_ON` rule.
+#   - `coordinator.KlereoCoordinator._show_confirmed_output` — without it, a Manual write
+#     only ever records `OUT_STATE_OFF`/`OUT_STATE_ON`, never a literal speed step.
+#
+# 🔴 On a CONFIRMED analogue pump, `switch.KlereoSwitch` also reads `real_status` under
+# Regulation — not an "always on" approximation, which an earlier draft shipped until the
+# reporter's own entity history graph showed `real_status` genuinely reaching 0 there (a
+# real stop, not a display glitch). See `models.KlereoOutput.real_status`.
+
+HEAT_MODE_STOP = 0
+HEAT_MODE_AUTO = 1
+HEAT_MODE_COOLING = 2
+HEAT_MODE_HEATING = 3
+
+HEAT_MODES = {
+    HEAT_MODE_STOP: "Off",
+    HEAT_MODE_AUTO: "Auto",
+    HEAT_MODE_COOLING: "Cooling",
+    HEAT_MODE_HEATING: "Heating",
+}
+
+# The `newState` that goes with each KlereoTherm mode on output 4.
+#
+# 🔴 MEASURED on the official web client, three captures over two installations,
+# 2026-09-06 (GitHub #55 — @nopbop and @StephanH27; Forgejo #166). It replaces the
+# upstream-sourced rule "any mode other than Manual expects AUTO", which is what this
+# integration sent on all four modes and which the wire contradicts on Heating.
+#
+# The value depends on the TARGET mode, not on the state the pump is leaving: Heating was
+# captured from *Auto* (a running pump) and from *Stopped*, and both sent 1. That is what
+# rules out the starting-state hypothesis this repository held for two days.
+#
+# ⚠️ Cooling is NOT measured — no reporter owns a reversible heat pump. It keeps the value
+# that shipped before the measurement, so an unmeasured cell changes nothing rather than
+# being extrapolated from a table with no pattern (1, 2, ?, 0).
+HEAT_MODE_STATES = {
+    HEAT_MODE_STOP: OUT_STATE_OFF,
+    HEAT_MODE_AUTO: OUT_STATE_AUTO,
+    HEAT_MODE_COOLING: OUT_STATE_AUTO,
+    HEAT_MODE_HEATING: OUT_STATE_ON,
+}
+
+
+def state_for_heat_mode(mode: int) -> int:
+    """Return the `newState` to send with a KlereoTherm `newMode` on output 4.
+
+    Shared by `switch`, `select` and `climate` so there is one copy of the table and not
+    three — the three sites carried three copies of the rule it replaces (#118).
+
+    An unrecognised mode falls back to AUTO, never to OFF: OFF is the command that stops
+    the heat pump, and resolving "unknown" to it would repeat the shape of #58, where a
+    request to turn the heating on switched it off.
+    """
+    return HEAT_MODE_STATES.get(mode, OUT_STATE_AUTO)
+
+# Human-readable output mode labels (int → label)
+OUTPUT_MODES = {
+    OUT_MODE_MAN: "Manual",
+    OUT_MODE_TIME_SLOTS: "Time Slots",
+    OUT_MODE_TIMER: "Timer",
+    OUT_MODE_REGUL: "Regulation",
+    OUT_MODE_FILTRATION_SYNC: "Filtration Sync",
+    OUT_MODE_MAINTENANCE: "Maintenance",
+    OUT_MODE_PULSE: "Pulse",
+    OUT_MODE_AUTOMATIC: "Automatic",
+}
+
+
+def extract_system_list(systems_response: Any) -> list:
+    """Pull the list of pool systems out of whatever shape `GetIndex` answered with.
+
+    🔴 Shared by the coordinator and the config flow ON PURPOSE. GitHub #56 is a login
+    that SUCCEEDS and returns zero pools — the flow declared success, the coordinator
+    later found nothing, and the user got a working integration with no entities and no
+    error anywhere. Catching that at setup means the flow has to read the same list the
+    coordinator will, and a second hand-rolled copy of this shape-juggling is how the two
+    would come to disagree about what "no pools" means.
+
+    Returns `[]` for every shape that is not a list of systems — the caller decides
+    whether empty is an error. Here it is never an exception, because on the coordinator's
+    side an empty refresh is a transient the retry loop handles.
+    """
+    if isinstance(systems_response, dict):
+        system_list = systems_response.get(
+            "response", systems_response.get("list_systems", [])
+        )
+    elif isinstance(systems_response, list):
+        system_list = systems_response
+    else:
+        system_list = []
+
+    if not isinstance(system_list, list):
+        system_list = []
+
+    return system_list
 
 
 class KlereoApiError(Exception):
@@ -153,8 +340,10 @@ class KlereoApi:
         Args:
             system_id: The pool system ID.
             out_index: Output index (0-15).
-            mode: Output mode (OUT_MODE_MAN=0, OUT_MODE_TIME_SLOTS=1, etc.).
-            state: Output state (OUT_STATE_OFF=0, OUT_STATE_ON=1).
+            mode: Output mode (OUT_MODE_MAN=0, OUT_MODE_TIME_SLOTS=1, etc.) —
+                except on OUT_IDX_HEATING, where it is a HEAT_MODE_* value.
+            state: Output state (OUT_STATE_OFF=0, OUT_STATE_ON=1,
+                OUT_STATE_AUTO=2 for any non-Manual mode).
         """
         return await self._request_with_retry(
             "POST",
@@ -164,6 +353,44 @@ class KlereoApi:
                 "outIdx": out_index,
                 "newMode": mode,
                 "newState": state,
+                "comMode": API_COM_MODE,
+            },
+        )
+
+    async def command_status(self, cmd_id: Any) -> Any:
+        """Ask what became of a queued command.
+
+        Args:
+            cmd_id: The cmdID returned by `set_output` or `set_param`.
+        """
+        return await self._request_with_retry(
+            "POST",
+            API_URL_COMMAND_STATUS,
+            data={"cmdID": cmd_id, "comMode": API_COM_MODE},
+        )
+
+    async def set_auto_off(self, system_id: str, out_index: int, off_delay: int) -> Any:
+        """Set an output's automatic-off timer, in minutes.
+
+        Args:
+            system_id: The pool system ID.
+            out_index: Output index (0-15).
+            off_delay: Timer in MINUTES. Upstream declares the field bounded 1-600
+                (`klereo.class.php` l.938-939), and the server validates it — a call
+                naming no delay answered `{"status":"error","detail":"Mauvais délais"}`.
+
+        Like `set_output` and `set_param`, this only QUEUES: the returned `cmdID` has to
+        be read back through `command_status`. Measured on Bioul 2026-09-08, from an
+        account at `access: 10` — so this endpoint needs no professional access, unlike
+        the four outputs `PRO_ONLY_OUTPUTS` names. See `docs/klereo-api.md`.
+        """
+        return await self._request_with_retry(
+            "POST",
+            API_URL_SET_AUTO_OFF,
+            data={
+                "poolID": system_id,
+                "outIdx": out_index,
+                "offDelay": off_delay,
                 "comMode": API_COM_MODE,
             },
         )

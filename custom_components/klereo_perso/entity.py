@@ -1,4 +1,5 @@
 """Base entity for Klereo."""
+import logging
 from collections.abc import Callable
 
 from homeassistant.config_entries import ConfigEntry
@@ -7,8 +8,208 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .api import HEAT_MODE_HEATING, HEAT_MODE_STOP, HEAT_MODES
+from .const import (
+    ACCESS_POOL_PROFESSIONAL,
+    DOMAIN,
+    HEATER_MODES_WITHOUT_COOLING,
+    HEATER_MODES_WITHOUT_SETPOINT,
+    PARAM_NAMES,
+    PARAM_SENTINELS,
+    PARAM_TYPES,
+    PRO_ONLY_OUTPUTS,
+)
 from .coordinator import KlereoCoordinator
+from .models import KlereoPoolDetails
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def setpoint_reading(value):
+    """Return a setpoint's value, or `None` when Klereo sent a sentinel instead.
+
+    `-2000` means the setpoint is DISABLED and `-1000` that it is UNKNOWN. Neither is a
+    measurement, and an entity holding one feeds Home Assistant's statistics, graphs and
+    averages a plausible, wrong number. Upstream discards both (`klereo.class.php`
+    l.873-896).
+
+    🔴 The VALUE is mapped, never the existence. Not creating the entity would delete one
+    installs already have and break any automation referencing it — the harm #128 and #135
+    exist to prevent. `None` renders as `unknown`, which is exactly what the sentinel says.
+
+    Shared by `sensor` (#137) and by `number` (#170), which reached the same rule from the
+    other side: once a sentinel stopped barring the writable `ConsigneEau`, the entity had
+    to exist while reading nothing. Two copies of this would be a drift waiting to happen.
+
+    ⚠️ The `isinstance` guard is not decoration. `regul_modes` is read UNFILTERED on
+    purpose (#94), so a value here is whatever Klereo sent; a bare `value in
+    PARAM_SENTINELS` raises `TypeError` on anything unhashable and would take a whole
+    platform down rather than one reading. And `-1` must NOT be caught: `const.py` calls
+    reusing it "a false friend that happens to work" — a setpoint of -1 is a real number.
+    """
+    if isinstance(value, int | float) and value in PARAM_SENTINELS:
+        return None
+    return value
+
+
+def configured_power(options, key: str) -> float | None:
+    """Return the power the user entered under `key`, or None when they entered none.
+
+    The third gate of this family, and the only one reading the config entry rather than
+    the payload — because the value it guards is the only one Klereo never sends. Same
+    rule as the other two nonetheless: what we cannot read never becomes a number.
+
+    🔴 Zero is "none", not "zero watts". It is how the options form takes a power back,
+    no equipment draws it, and honouring it literally would build the entity #163 exists
+    to refuse — one that always reports `0` and is therefore indistinguishable from a
+    correct one on a pump at rest. Home Assistant would read those zeroes as counter
+    resets on a `total_increasing` and charge a cycle for each.
+
+    ⚠️ Negative is refused here as well as in the form. The form validates a NEW entry;
+    this reads whatever was persisted, including by a version that had no such check —
+    the same split, and the same reason, as the scan-interval floor (#139).
+    """
+    if not options:
+        return None
+    try:
+        watts = float(options[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if watts <= 0:
+        _LOGGER.debug("No energy entity for %s: power %s is not a consumption", key, watts)
+        return None
+    return watts
+
+
+def is_output_offered(index: int, details: KlereoPoolDetails) -> bool:
+    """Return whether this account may be offered an entity for this output.
+
+    Outputs 2, 3, 8 and 15 take a `newMode` whose meaning is undocumented, and upstream
+    refuses to command them below professional access rather than guessing it. Offering a
+    switch or a select there hands the user a control whose every write comes back as
+    status 13 — visible as an error since #95, and silently wrong before it.
+
+    ⚠️ An unknown `access` NEVER gates. The field is optional, and "we do not know" must
+    not remove an entity a working installation already has. Same rule, and the same
+    reason, as `_is_offered` in `number.py`.
+    """
+    if index not in PRO_ONLY_OUTPUTS:
+        return True
+    if details.access is None or details.access >= ACCESS_POOL_PROFESSIONAL:
+        return True
+    _LOGGER.debug(
+        "Skipping output %s: account access %s is below the required %s",
+        index, details.access, ACCESS_POOL_PROFESSIONAL,
+    )
+    return False
+
+
+def is_setpoint_offered(key: str, details: KlereoPoolDetails) -> bool:
+    """Return whether this installation may be offered a WRITABLE setpoint for this key.
+
+    Shared by `number` — which creates the entity when this is true — and by `sensor`,
+    which keeps its read-only entity when it is false. That sharing is the whole point:
+    the two platforms must not disagree about a key, or a refused write would delete the
+    reading as well. `sensor` used to exclude on `key in PARAM_TYPES` alone, so an account
+    below the required access lost the setpoint entirely instead of falling back (#128).
+
+    The value is read from `details.settings` rather than passed in, so both callers
+    necessarily judge the same number whichever container it arrived in.
+
+    🔴 DISJOINT from `climate`'s creation gate BY CONSTRUCTION — do not "align" the two
+    (Forgejo #172). A setpoint is a parameter of the POOL: `number` writes `SetParam.php`
+    with `poolID`, `paramID` and `newValue`, and output 4 appears nowhere on that path.
+    `climate` exists only where output 4 does because its modes write `SetOut.php` with
+    `outIdx: 4` — a different endpoint on a different object. A box with `HeaterMode` set
+    and no output 4 therefore correctly carries a writable setpoint and no thermostat;
+    gating this on the output would DELETE that setpoint, which is #128 / #135 again.
+    `climate` itself already uses both gates separately: modes on the output,
+    `async_set_temperature` on this one. `tests/test_disjoint_gates.py` holds them apart.
+
+    ⚠️ An unknown answer NEVER gates. A payload carrying no `access`, no `HeaterMode` or
+    no `pHMode` must keep the entity it has today. Only a value we can read, and that says
+    "no", removes one. Same rule, and the same reason, as `is_output_offered` above.
+    """
+    param = PARAM_TYPES[key]
+    value = details.settings.get(key)
+
+    # 🔴 A sentinel is a VALUE, not a permission — and reading it as one was refuted by
+    # measurement on 2026-09-07 (GitHub #55, Forgejo #170). The box ACCEPTED `SetParam
+    # ConsigneEau` while the stored value read `-2000`: both queued commands answered
+    # `status: 9, detail: "Ok"`, and the box's own front panel went from `Arrêté` to
+    # `25.0 °C` and stayed there. The old bar was self-perpetuating — no writable entity
+    # meant nobody could ever write the value, which kept it at `-2000` forever, which is
+    # how GH #55 stayed stuck for a month.
+    #
+    # ⚠️ It STILL bars every key that has a read-only fallback, and that asymmetry is the
+    # whole fix rather than a shortcut. `sensor` creates a `KlereoParamSensor` for a key in
+    # PARAM_NAMES exactly when this returns False, so lifting the bar there would REPLACE
+    # `sensor.ph_setpoint` with `number.ph_setpoint` on every install carrying a sentinel:
+    # a deleted entity and a broken automation, which is #128 and #135 again. `ConsigneEau`
+    # is deliberately NOT in PARAM_NAMES (see `const.py`), so it has no fallback and barring
+    # it yielded no entity at all. Never delete is the rule; this bar was deleting.
+    if value in PARAM_SENTINELS and key in PARAM_NAMES:
+        _LOGGER.debug("Skipping %s: sentinel value %s, falling back to its sensor", key, value)
+        return False
+
+    min_access = param.get("min_access")
+    if min_access is not None and details.access is not None and details.access < min_access:
+        _LOGGER.debug(
+            "Skipping %s: account access %s is below the required %s",
+            key, details.access, min_access,
+        )
+        return False
+
+    if param.get("needs_heater"):
+        heater_mode = details.settings.get("HeaterMode")
+        if heater_mode in HEATER_MODES_WITHOUT_SETPOINT:
+            _LOGGER.debug("Skipping %s: HeaterMode %s carries no setpoint", key, heater_mode)
+            return False
+
+    # Upstream gates the pH setpoint on `pHMode > 0` and on nothing else (l.878-880). The
+    # comparison is written so that anything not readable as a number — absent, None, a
+    # string Klereo has not documented — falls through and does NOT bar.
+    if param.get("needs_ph_mode"):
+        ph_mode = details.settings.get("pHMode")
+        try:
+            regulates_ph = ph_mode > 0
+        except TypeError:
+            regulates_ph = True
+        if not regulates_ph:
+            _LOGGER.debug("Skipping %s: pHMode %s regulates no pH", key, ph_mode)
+            return False
+
+    return True
+
+
+def offered_heat_modes(details: KlereoPoolDetails) -> list[int]:
+    """Return the KlereoTherm modes this installation's heating hardware can be set to.
+
+    Upstream offers Auto and Cooling to `HeaterMode` 2 and 4 alone — the real heat pumps
+    (`klereo.class.php` l.929). An on/off heater offered "Cooling" accepts the command,
+    answers status 9, and does nothing: a write that the two-step confirmation of #115
+    cannot catch, because nothing refuses it (#124).
+
+    🔴 An unknown `HeaterMode` NEVER bars, and the gate is written as a positive list of
+    the types KNOWN to be heat-only rather than upstream's "everything that is not 2 or
+    4". Over-filtering is the dangerous direction: it would remove a control an
+    installation uses today, to fix an option that is merely inert.
+
+    Shared by the `select` and the `climate` entity on purpose. They are the same table —
+    a thermostat offering `cool` on an on/off heater would be this defect again, more
+    visible — and a second copy of it is a drift waiting to happen (#118).
+    """
+    heater_mode = details.settings.get("HeaterMode")
+    try:
+        is_heat_only = heater_mode in HEATER_MODES_WITHOUT_COOLING
+    except TypeError:
+        # An unhashable value is as unknown as a missing one, and must not bar either.
+        is_heat_only = False
+    if not is_heat_only:
+        return list(HEAT_MODES)
+
+    _LOGGER.debug("HeaterMode %s cannot cool: offering only Off and Heating", heater_mode)
+    return [HEAT_MODE_STOP, HEAT_MODE_HEATING]
 
 
 class KlereoEntity(CoordinatorEntity[KlereoCoordinator]):
@@ -21,26 +222,57 @@ class KlereoEntity(CoordinatorEntity[KlereoCoordinator]):
         super().__init__(coordinator)
         self.system_id = system_id
 
+    def _system(self):
+        """Return this entity's system, or None once the payload stops carrying it."""
+        return self.coordinator.data.get(self.system_id)
+
+    def _is_analogue_pump(self) -> bool:
+        """Return whether THIS system reports a variable-speed Filtration pump.
+
+        Shared by `switch.KlereoSwitch` and `select.KlereoOutputModeSelect` — an
+        entity with no system yet (payload gone) is not a confirmed analogue pump,
+        so this falls through to the general ON/OFF rule rather than guessing.
+        See `models.KlereoPoolDetails.is_analogue_pump` for the underlying gate.
+        """
+        system = self._system()
+        return system is not None and system.details.is_analogue_pump
+
+    @property
+    def available(self) -> bool:
+        """Return whether the payload still carries what this entity reports on.
+
+        🔴 A PROPERTY, never `self._attr_available = ...` in an update callback.
+        `CoordinatorEntity.available` is itself a property returning
+        `coordinator.last_update_success`, and a property SHADOWS `_attr_available`
+        entirely — so assigning that attribute changes nothing an entity ever reports.
+        Five platforms did exactly that, and their entities never went unavailable no
+        matter what disappeared from the payload; the nine assertions covering it were
+        green because they asserted the attribute the code had just written, not the
+        behaviour. #130, and the same failure as #115.
+
+        `super().available` stays in the conjunction: a failed refresh must keep making
+        the entity unavailable, which is the half that already worked.
+
+        Subclasses that follow a particular probe or output narrow this further; the
+        system check here is what every Klereo entity has in common.
+        """
+        return super().available and self._system() is not None
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information."""
-        system = self.coordinator.data.get(self.system_id, {})
-        info = system.get("info", {})
-        details = system.get("details", {})
-        name = info.get("poolNickname", "Klereo Pool")
-
-        # affSW/tabSW (display/control-box firmware) and podSerial are only
-        # present in the detailed payload, not the lightweight system list.
-        sw_version = details.get("affSW") or details.get("tabSW")
-        serial_number = details.get("podSerial")
-
+        system = self._system()
+        name = system.info.pool_nickname if system else "Klereo Pool"
+        # Perso layer: firmware (affSW/tabSW) and serial (podSerial) live only in the
+        # detailed payload, not in the lightweight system list.
+        raw = system.details.raw if system else {}
         return DeviceInfo(
             identifiers={(DOMAIN, self.system_id)},
             name=name,
             manufacturer="Klereo",
             model="Pool System",
-            sw_version=sw_version,
-            serial_number=serial_number,
+            sw_version=raw.get("affSW") or raw.get("tabSW"),
+            serial_number=raw.get("podSerial"),
         )
 
 
@@ -48,7 +280,7 @@ def setup_discovery(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    extract_fn: Callable[[KlereoCoordinator, str, dict], list[KlereoEntity]],
+    extract_fn: Callable[[KlereoCoordinator, str, KlereoPoolDetails], list[KlereoEntity]],
 ) -> None:
     """Set up dynamic entity discovery for a platform.
 
@@ -63,8 +295,7 @@ def setup_discovery(
     def _discover() -> None:
         new_entities: list[KlereoEntity] = []
         for system_id, system_data in coordinator.data.items():
-            details = system_data.get("details", {})
-            for uid, entity in extract_fn(coordinator, system_id, details):
+            for uid, entity in extract_fn(coordinator, system_id, system_data.details):
                 if uid not in known_ids:
                     known_ids.add(uid)
                     new_entities.append(entity)

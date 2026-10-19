@@ -5,166 +5,129 @@ import re
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    CELL_TELEMETRY_SENSORS,
-    PARAM_INFO_SENSORS,
+    ALERT_LABELS,
+    ALERT_PARAM_CALIBRATION,
+    ALERT_PARAM_IS_ERROR_CODE,
+    ALERT_PARAM_IS_FLOW,
+    ALERT_PARAM_IS_OUTPUT,
+    ALERT_PARAM_IS_PROBE,
+    ALERT_PARAM_IS_PUMP,
+    ALERT_PARAM_PREFIXES,
+    BINARY_SENSOR_TYPES,
+    DERIVED_COUNTER_TYPES,
+    ENERGY_COUNTER_TYPES,
+    NO_REFERENCE_PROBE,
+    OUTPUT_NAMES,
+    PARAM_COUNTER_TYPES,
     PARAM_NAMES,
     PARAM_TYPES,
-    PODINFO_SENSORS,
-    PUMP_TELEMETRY_SENSORS,
+    PUMP_TELEMETRY_TYPES,
     SENSOR_TYPES,
-    SYSTEM_DIAGNOSTIC_SENSORS,
-    SYSTEM_SENSORS,
 )
-from .entity import KlereoEntity, setup_discovery
-from .schedule import PLAN_ECREMAGE, PLAN_FILTRATION, decode_plan, schedule_text
+from .entity import (
+    KlereoEntity,
+    configured_power,
+    is_setpoint_offered,
+    setup_discovery,
+)
+from .entity import setpoint_reading as _reading
+from .models import KlereoAlert, KlereoPoolDetails, KlereoProbe
+from .perso import extract_perso_sensors, probe_extra_attributes  # perso layer
 
 _LOGGER = logging.getLogger(__name__)
-
-# Keys structurally handled elsewhere (lists that become their own entities,
-# or dicts consumed by dedicated logic below) — never surfaced by the
-# generic raw-field fallback, to avoid duplicating entities.
-_ROOT_STRUCTURAL_KEYS = {
-    "probes", "outs", "alerts", "plans", "RegulModes", "params",
-    "ExtraParams", "IORename", "podinfo", "register",
-    "_probe_index", "_output_index",
-    "idSystem", "poolNickname", "idLinked",
-    "alertCount", "notifyCount",  # already covered by KlereoAlertCountSensor
-}
-_EXTRAPARAMS_NESTED_DICT_KEYS = {"Debit1", "Debit2"}
 
 
 def _humanize_key(key: str) -> str:
     """Convert a camelCase API key to a human-readable name."""
-    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", key).strip()
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", key)
 
 
-def _curated_keys() -> set:
-    """All keys already surfaced by a curated (named, typed) entity.
+def _extract_sensors(coordinator, system_id, details: KlereoPoolDetails, options=None):
+    """Extract probe sensors and param sensors from system details.
 
-    Excluded from the generic raw-field fallback so nothing is duplicated.
+    `options` carries the config entry's options — read for the per-equipment powers
+    below, and for nothing else. It defaults to None so that the energy counters, whose
+    second term the user supplies, are absent unless something explicitly supplies it.
     """
-    return (
-        set(PARAM_TYPES)
-        | set(PARAM_INFO_SENSORS)
-        | set(PUMP_TELEMETRY_SENSORS)
-        | set(CELL_TELEMETRY_SENSORS)
-        | set(SYSTEM_DIAGNOSTIC_SENSORS)
-        | set(SYSTEM_SENSORS)
-        | set(PODINFO_SENSORS)
-    )
-
-
-def _extract_sensors(coordinator, system_id, details):
-    """Extract all sensor entities from system details."""
     items = []
-
-    for probe in details.get("probes", []):
-        if probe.get("index") is None:
+    for probe in details.probes:
+        if probe.type in BINARY_SENSOR_TYPES:
             continue
-        uid = f"{system_id}_sensor_{probe['index']}"
+        uid = f"{system_id}_sensor_{probe.index}"
         items.append((uid, KlereoSensor(coordinator, system_id, probe)))
 
-    # Regulation mode sensors (RegulModes). Writable setpoints (PARAM_TYPES)
-    # are excluded here since they become number entities instead.
-    for key, value in details.get("RegulModes", {}).items():
-        if key in PARAM_TYPES:
+    # A writable setpoint becomes a `number` instead — but ONLY when the write is actually
+    # offered. When a guard refuses it (access too low, pHMode off, HeaterMode without a
+    # setpoint), the read-only sensor stays: the account cannot write the value, and that
+    # is no reason to stop showing it. Excluding on `key in PARAM_TYPES` alone is what
+    # #128 fixes; it would have deleted three sensors from every account below access 16.
+    # `key not in PARAM_NAMES` is what keeps `ConsigneEau` out. This loop is otherwise
+    # unfiltered, so without it a refused water setpoint would fall back here even though
+    # it has never been a sensor — and on a sentinel payload that means a brand-new entity
+    # reading -2000. The `params` loop below already carries the same condition.
+    for key, value in details.regul_modes.items():
+        if key in PARAM_TYPES and (is_setpoint_offered(key, details) or key not in PARAM_NAMES):
             continue
         uid = f"{system_id}_param_{key}"
         items.append((uid, KlereoParamSensor(coordinator, system_id, key, value)))
 
-    # --- Curated sensors from named sub-sections ---
-    for key in details.get("params", {}):
-        if key not in PARAM_INFO_SENSORS:
+    # `params` is only read through the curated PARAM_NAMES list. Upstream reads that
+    # container at 40+ sites — consumption counters, setpoint bounds, internal flags — so
+    # taking every key would create dozens of entities in every install. `RegulModes`
+    # above stays unfiltered: it is what current installs already show, and narrowing it
+    # would delete entities users have.
+    seen = set(details.regul_modes)
+    for container in (details.params, details.extra_params):
+        for key, value in container.items():
+            if key in seen or key not in PARAM_NAMES:
+                continue
+            if key in PARAM_TYPES and is_setpoint_offered(key, details):
+                continue
+            seen.add(key)
+            uid = f"{system_id}_param_{key}"
+            items.append((uid, KlereoParamSensor(coordinator, system_id, key, value)))
+
+    # Product consumption is the one figure Klereo does not send: it exists only as a run
+    # time multiplied by a pump flow rate. Each entity is gated on BOTH keys being read,
+    # never assumed — an installation without a pH- pump carries neither, and that same
+    # gate is what keeps the two chlorine pumps exclusive without reading `HybrideMode`.
+    settings = details.settings
+    for key, spec in DERIVED_COUNTER_TYPES.items():
+        if spec["source"] not in settings or spec["rate"] not in settings:
             continue
-        uid = f"{system_id}_paraminfo_{key}"
-        items.append(
-            (uid, KlereoFieldSensor(coordinator, system_id, ("params",), key, PARAM_INFO_SENSORS[key], uid))
-        )
+        uid = f"{system_id}_consumption_{key}"
+        items.append((uid, KlereoDerivedSensor(coordinator, system_id, key, spec)))
 
-    extra_params = details.get("ExtraParams", {})
-    for key in extra_params:
-        if key in PUMP_TELEMETRY_SENSORS:
-            uid = f"{system_id}_pump_{key}"
-            items.append(
-                (uid, KlereoFieldSensor(coordinator, system_id, ("ExtraParams",), key, PUMP_TELEMETRY_SENSORS[key], uid))
-            )
-        elif key in CELL_TELEMETRY_SENSORS:
-            uid = f"{system_id}_cell_{key}"
-            items.append(
-                (uid, KlereoFieldSensor(coordinator, system_id, ("ExtraParams",), key, CELL_TELEMETRY_SENSORS[key], uid))
-            )
+    # Energy is the same gate one step further out: the run time is on the wire, and the
+    # watt is not on the wire at ALL — Klereo sends no power, so it comes from the user.
+    #
+    # 🔴 No power entered, no entity. A default would be a credible number in a unit that
+    # has a price, in a dashboard someone reads to decide (#105); and a zero would be
+    # worse than useless, since Home Assistant reads a zero on a `total_increasing` as a
+    # counter reset rather than as "unknown". The counter half is gated for the same
+    # reason as the product volumes: an installation with no heat pump sends no
+    # `Chauff_*`, and a power entered for hardware that is not there meters nothing.
+    for key, spec in ENERGY_COUNTER_TYPES.items():
+        if spec["source"] not in settings:
+            continue
+        watts = configured_power(options, spec["power_option"])
+        if watts is None:
+            continue
+        uid = f"{system_id}_energy_{key}"
+        items.append((uid, KlereoEnergySensor(coordinator, system_id, key, spec, watts)))
 
-    for key in SYSTEM_DIAGNOSTIC_SENSORS:
-        if key in details:
-            uid = f"{system_id}_sysdiag_{key}"
-            meta = {**SYSTEM_DIAGNOSTIC_SENSORS[key], "diagnostic": True}
-            items.append((uid, KlereoFieldSensor(coordinator, system_id, (), key, meta, uid)))
+    # Unconditionally, NOT on the presence of `alerts`: the key is absent when there is
+    # nothing to report (GitHub #57), so keying the entity on it would make an alert
+    # sensor that exists only while something is wrong — and vanishes, with its history,
+    # the moment the pool is healthy. Same rule as the setpoint gates: a thing we cannot
+    # read never removes an entity.
+    items.append((f"{system_id}_alerts", KlereoAlertSensor(coordinator, system_id)))
 
-    for key in SYSTEM_SENSORS:
-        if key in details:
-            uid = f"{system_id}_sys_{key}"
-            items.append((uid, KlereoFieldSensor(coordinator, system_id, (), key, SYSTEM_SENSORS[key], uid)))
-
-    podinfo = details.get("podinfo", {})
-    for key in PODINFO_SENSORS:
-        if key in podinfo:
-            uid = f"{system_id}_podinfo_{key}"
-            meta = {**PODINFO_SENSORS[key], "diagnostic": True}
-            items.append((uid, KlereoFieldSensor(coordinator, system_id, ("podinfo",), key, meta, uid)))
-
-    # --- Generic raw fallback ---
-    # Every remaining scalar field, anywhere in the payload, not already
-    # surfaced above. Diagnostic category + disabled by default so it
-    # doesn't clutter the entity list, but nothing from the Klereo API is
-    # silently dropped — enable individual fields from the entity registry
-    # if you need one that isn't curated above.
-    curated = _curated_keys()
-
-    def _add_raw(source_path, source_dict, uid_prefix):
-        for key, value in source_dict.items():
-            if key in curated or isinstance(value, (dict, list)):
-                continue
-            uid = f"{system_id}_raw_{uid_prefix}_{key}"
-            meta = {"name": f"Raw: {_humanize_key(key)}", "unit": None, "diagnostic": True}
-            items.append((uid, KlereoFieldSensor(coordinator, system_id, source_path, key, meta, uid)))
-
-    _add_raw((), {k: v for k, v in details.items() if k not in _ROOT_STRUCTURAL_KEYS}, "root")
-    _add_raw(("params",), details.get("params", {}), "params")
-
-    extra_scan = {k: v for k, v in extra_params.items() if k not in _EXTRAPARAMS_NESTED_DICT_KEYS}
-    _add_raw(("ExtraParams",), extra_scan, "extra")
-    for nested_key in _EXTRAPARAMS_NESTED_DICT_KEYS:
-        nested = extra_params.get(nested_key, {})
-        if isinstance(nested, dict):
-            _add_raw(("ExtraParams", nested_key), nested, f"extra_{nested_key.lower()}")
-
-    _add_raw(("register",), details.get("register", {}), "register")
-    _add_raw(("podinfo",), {k: v for k, v in podinfo.items() if k not in PODINFO_SENSORS}, "podinfo")
-
-    # Schedule plans. Keep the original overview entity for backwards
-    # compatibility and additionally expose one decoded sensor per plan.
-    if "plans" in details:
-        uid = f"{system_id}_schedule_plans"
-        items.append((uid, KlereoSchedulePlansSensor(coordinator, system_id)))
-        for plan in details.get("plans", []):
-            if plan.get("index") is None:
-                continue
-            plan_index = int(plan["index"])
-            plan_uid = f"{system_id}_plan_{plan_index}"
-            items.append((
-                plan_uid,
-                KlereoSchedulePlanSensor(coordinator, system_id, plan_index),
-            ))
-
-    # System-level alert counter, always created once alerts info is present.
-    if "alertCount" in details or "alerts" in details:
-        uid = f"{system_id}_alert_count"
-        items.append((uid, KlereoAlertCountSensor(coordinator, system_id)))
-
+    # Perso layer (fork-only entities: raw/curated field sensors, schedule plans, ...).
+    items.extend(extract_perso_sensors(coordinator, system_id))
     return items
 
 
@@ -174,17 +137,24 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Klereo sensors."""
-    setup_discovery(hass, entry, async_add_entities, _extract_sensors)
+
+    def _extract(coordinator, system_id, details):
+        # `entry.options` is read at each discovery rather than captured once, so a power
+        # entered later is seen. Changing an option also reloads the entry
+        # (`_async_update_listener`), which is what rebuilds the entities themselves.
+        return _extract_sensors(coordinator, system_id, details, entry.options)
+
+    setup_discovery(hass, entry, async_add_entities, _extract)
 
 
 class KlereoSensor(KlereoEntity, SensorEntity):
     """Representation of a Klereo probe sensor."""
 
-    def __init__(self, coordinator, system_id, sensor_data):
+    def __init__(self, coordinator, system_id, probe: KlereoProbe):
         """Initialize the sensor."""
         super().__init__(coordinator, system_id)
-        self._index = sensor_data.get("index")
-        self._type = sensor_data.get("type")
+        self._index = probe.index
+        self._type = probe.type
 
         sensor_def = SENSOR_TYPES.get(self._type, {})
 
@@ -197,43 +167,81 @@ class KlereoSensor(KlereoEntity, SensorEntity):
         if state_class:
             self._attr_state_class = SensorStateClass(state_class)
 
-        self._update_from_data(sensor_data)
+        self._update_from_probe(probe)
+
+    @property
+    def available(self) -> bool:
+        """Return False once the payload stops carrying this probe.
+
+        Narrows the base property, which only checks the system. A probe that vanishes
+        used to leave the entity pinned to its last reading forever (#130).
+        """
+        return super().available and self._find_my_probe() is not None
 
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        data = self._find_my_data()
-        if data:
-            self._attr_available = True
-            self._update_from_data(data)
-        else:
-            self._attr_available = False
+        probe = self._find_my_probe()
+        if probe:
+            self._update_from_probe(probe)
         super()._handle_coordinator_update()
 
-    def _update_from_data(self, data):
+    def _update_from_probe(self, probe: KlereoProbe):
         """Update state from probe data."""
-        value = data.get("filteredValue")
+        value = probe.filtered_value
         if value is None:
-            value = data.get("directValue")
+            value = probe.direct_value
         self._attr_native_value = value
-        self._attr_extra_state_attributes = {
-            "type": data.get("type"),
-            "status": data.get("status"),
-            "threshold_min": data.get("seuilMin"),
-            "threshold_max": data.get("seuilMax"),
-            "updated": data.get("updated"),
-            "filtered_time": data.get("filteredTime"),
-            "direct_time": data.get("directTime"),
-            "update_time": data.get("updateTime"),
-            "calibration": [data.get("calib1"), data.get("calib2"), data.get("calib3")],
+        attributes = {
+            "type": probe.type,
+            "status": probe.status,
         }
+        references = self._regulations_i_drive()
+        if references:
+            # Absent rather than empty: an empty list reads as a claim that we looked and
+            # found none, which is not what an installation sending no reference fields
+            # is telling us.
+            attributes["regulation_reference"] = references
+        # Perso layer: every other field the API sends for a probe.
+        attributes.update(probe_extra_attributes(self.coordinator, self.system_id, self._index))
+        self._attr_extra_state_attributes = attributes
 
-    def _find_my_data(self):
+    def _regulations_i_drive(self) -> list[str]:
+        """Return the regulation loops this probe is the reference sensor for.
+
+        Always a list. A probe named by two loops has never been measured, and a list
+        needs no special path for it — where a string would need a rule invented on the
+        spot, the first time it happens, in production.
+        """
+        system = self.coordinator.data.get(self.system_id)
+        if system is None:
+            return []
+        details = system.details
+        driven = []
+        for name, index in sorted(details.regulation_probes.items()):
+            if index == NO_REFERENCE_PROBE:
+                # A normal installation, not an anomaly: the measured payload carries
+                # `PressionCapteur: -1` on a pool with no pressure sensor. Not logged at
+                # all — this runs once per probe per refresh, and a debug line here was
+                # most of the volume of a real debug log (GitHub #55, 2026-09-15). The
+                # `-1` itself stays readable in the diagnostics export.
+                continue
+            if index not in details.probe_index:
+                _LOGGER.warning(
+                    "Regulation %s names probe %s, which this installation does not report",
+                    name, index,
+                )
+                continue
+            if index == self._index:
+                driven.append(name)
+        return driven
+
+    def _find_my_probe(self) -> KlereoProbe | None:
         """Find this probe's data in the coordinator data."""
-        if self.system_id not in self.coordinator.data:
+        system = self.coordinator.data.get(self.system_id)
+        if system is None:
             return None
-        details = self.coordinator.data[self.system_id].get("details", {})
-        return details.get("_probe_index", {}).get(self._index)
+        return system.details.probe_index.get(self._index)
 
 
 class KlereoParamSensor(KlereoEntity, SensorEntity):
@@ -246,232 +254,245 @@ class KlereoParamSensor(KlereoEntity, SensorEntity):
 
         self._attr_unique_id = f"{system_id}_param_{key}"
         self._attr_name = PARAM_NAMES.get(key, _humanize_key(key))
-        self._attr_native_value = initial_value
+        self._attr_native_value = _reading(initial_value)
 
-    @callback
-    def _handle_coordinator_update(self):
-        """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
-            return super()._handle_coordinator_update()
-        self._attr_available = True
-        details = self.coordinator.data[self.system_id].get("details", {})
-        regul = details.get("RegulModes", {})
-        if self._key in regul:
-            self._attr_native_value = regul[self._key]
-        super()._handle_coordinator_update()
-
-
-class KlereoFieldSensor(KlereoEntity, SensorEntity):
-    """Generic sensor that reads a single field from a nested details path.
-
-    `source_path` is a tuple of dict keys to descend into `details` before
-    looking up `field_key` — e.g. `()` for the details root, `("params",)`,
-    or `("ExtraParams", "Debit1")`. Used both for curated, named sensors
-    (pump telemetry, pool volume...) and for the generic raw-field fallback
-    that surfaces every remaining scalar value reported by the Klereo API,
-    so nothing is silently dropped.
-    """
-
-    def __init__(self, coordinator, system_id, source_path, field_key, meta, unique_id):
-        """Initialize the field sensor."""
-        super().__init__(coordinator, system_id)
-        self._source_path = source_path
-        self._field_key = field_key
-
-        self._attr_unique_id = unique_id
-        self._attr_name = meta["name"]
-        self._attr_native_unit_of_measurement = meta.get("unit")
-        self._attr_device_class = meta.get("device_class")
-
-        state_class = meta.get("state_class")
+        # Counters and pump telemetry carry a unit and a class where one is actually
+        # confirmed; an ordinary regulation parameter carries neither, and giving it a
+        # plausible one would be a guess. The two typed tables are disjoint by key, so
+        # checking one then the other never shadows a real entry with an empty one.
+        counter = PARAM_COUNTER_TYPES.get(key) or PUMP_TELEMETRY_TYPES.get(key, {})
+        self._attr_native_unit_of_measurement = counter.get("unit")
+        self._attr_device_class = counter.get("device_class")
+        self._attr_icon = counter.get("icon")
+        state_class = counter.get("state_class")
         if state_class:
             self._attr_state_class = SensorStateClass(state_class)
 
-        if meta.get("diagnostic"):
-            self._attr_entity_category = EntityCategory.DIAGNOSTIC
-            self._attr_entity_registry_enabled_default = False
-
-        self._update_value(coordinator.data.get(system_id, {}).get("details", {}))
-
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
+        system = self._system()
+        if system is None:
             return super()._handle_coordinator_update()
-        self._attr_available = True
-        details = self.coordinator.data[self.system_id].get("details", {})
-        self._update_value(details)
+        settings = system.details.settings
+        if self._key in settings:
+            self._attr_native_value = _reading(settings[self._key])
         super()._handle_coordinator_update()
 
-    def _update_value(self, details):
-        """Descend `source_path` from `details` and read `field_key`."""
-        node = details
-        for part in self._source_path:
-            node = node.get(part, {}) if isinstance(node, dict) else {}
-        if isinstance(node, dict) and self._field_key in node:
-            self._attr_native_value = node[self._field_key]
 
+class KlereoDerivedSensor(KlereoEntity, SensorEntity):
+    """A product volume computed from a run time and a pump flow rate.
 
-class KlereoSchedulePlansSensor(KlereoEntity, SensorEntity):
-    """Overview of all schedule plans returned by Klereo."""
+    The only entity on this platform whose value is not on the wire. Klereo sends how long
+    the dosing pump ran and how fast it pumps; the litres are upstream's arithmetic
+    (`klereo.class.php` l.335-380), and reproducing it here is what answers #54's actual
+    request — litres of pH-, not hours of pump.
+    """
 
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = False
-    _attr_icon = "mdi:calendar-clock"
-
-    def __init__(self, coordinator, system_id):
-        """Initialize the schedule plans overview sensor."""
+    def __init__(self, coordinator, system_id, key, spec):
+        """Initialize the derived sensor."""
         super().__init__(coordinator, system_id)
-        self._attr_unique_id = f"{system_id}_schedule_plans"
-        self._attr_name = "Schedule Plans"
-        self._update_from_data(coordinator.data.get(system_id, {}).get("details", {}))
+        self._key = key
+        self._spec = spec
+
+        self._attr_unique_id = f"{system_id}_consumption_{key}"
+        self._attr_name = spec["name"]
+        self._attr_native_unit_of_measurement = spec["unit"]
+        self._attr_device_class = spec["device_class"]
+        self._attr_state_class = SensorStateClass(spec["state_class"])
+        self._attr_native_value = self._compute()
 
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
+        system = self._system()
+        if system is None:
             return super()._handle_coordinator_update()
-        self._attr_available = True
-        details = self.coordinator.data[self.system_id].get("details", {})
-        self._update_from_data(details)
+        self._attr_native_value = self._compute()
         super()._handle_coordinator_update()
 
-    def _update_from_data(self, details):
-        """Update the overview with decoded plans."""
-        plans = details.get("plans", [])
-        decoded_plans = []
-        for plan in plans:
-            index = plan.get("index")
-            if index is None:
-                continue
-            decoded = decode_plan(int(index), plan.get("plan64", ""))
-            if decoded is None:
-                continue
-            decoded_plans.append(
-                {
-                    "index": int(index),
-                    "plan64": plan.get("plan64"),
-                    "updateTime": plan.get("updateTime"),
-                    "format": decoded.get("format"),
-                    "active_slots": decoded.get("active_slots"),
-                    "schedule": schedule_text(decoded, int(index)),
-                }
+    def _compute(self):
+        """Return the volume, or None when either reading is missing or unreadable.
+
+        None is the honest report. Turning "we cannot read this" into a number would be
+        the #105 failure applied to a consumption total, where a plausible-looking litre
+        count is exactly what nobody would question.
+        """
+        system = self.coordinator.data.get(self.system_id)
+        if system is None:
+            return None
+        settings = system.details.settings
+        try:
+            seconds = float(settings[self._spec["source"]])
+            rate = float(settings[self._spec["rate"]])
+        except (KeyError, TypeError, ValueError):
+            _LOGGER.debug(
+                "Cannot compute %s: %s or %s is missing or unreadable",
+                self._key, self._spec["source"], self._spec["rate"],
             )
-        self._attr_native_value = len(decoded_plans)
-        self._attr_extra_state_attributes = {"plans": decoded_plans}
+            return None
+        return round(seconds * rate / self._spec["divisor"], 2)
 
 
-class KlereoSchedulePlanSensor(KlereoEntity, SensorEntity):
-    """Decoded 15-minute Klereo schedule plan."""
+class KlereoEnergySensor(KlereoEntity, SensorEntity):
+    """Kilowatt-hours computed from a run time on the wire and a power from the user.
 
-    _attr_icon = "mdi:calendar-clock"
+    The second entity here whose value is not on the wire, and the first whose second term
+    is not on the wire either: Klereo sends no power. The watt is a per-equipment option,
+    and this entity exists only because one was entered — the gate lives in
+    `_extract_sensors`, so an equipment with no power has no entity to be wrong with.
 
-    def __init__(self, coordinator, system_id, plan_index):
-        """Initialize a decoded schedule plan sensor."""
+    Asked for by @StephanH27 (GitHub #60) for the Home Assistant Energy dashboard, which
+    is why the shape is fixed: kWh, `energy`, `total_increasing`. Forgejo #163.
+    """
+
+    def __init__(self, coordinator, system_id, key, spec, watts: float):
+        """Initialize the energy sensor."""
         super().__init__(coordinator, system_id)
-        self._plan_index = plan_index
-        self._attr_unique_id = f"{system_id}_plan_{plan_index}"
-        self._attr_name = self._name_for_index(plan_index)
-        self._update_from_data(coordinator.data.get(system_id, {}).get("details", {}))
+        self._key = key
+        self._spec = spec
+        self._watts = watts
 
-    @staticmethod
-    def _name_for_index(plan_index: int) -> str:
-        """Return a useful name for known Klereo plan indexes."""
-        if plan_index == PLAN_FILTRATION:
-            return "Filtration Schedule"
-        if plan_index == PLAN_ECREMAGE:
-            return "Skimming Schedule"
-        if plan_index == 254:
-            return "Plan 254 (3 Masks)"
-        return f"Plan {plan_index}"
+        self._attr_unique_id = f"{system_id}_energy_{key}"
+        self._attr_name = spec["name"]
+        self._attr_native_unit_of_measurement = spec["unit"]
+        self._attr_device_class = spec["device_class"]
+        self._attr_state_class = SensorStateClass(spec["state_class"])
+        self._attr_native_value = self._compute()
 
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
+        system = self._system()
+        if system is None:
             return super()._handle_coordinator_update()
-        details = self.coordinator.data[self.system_id].get("details", {})
-        if self._update_from_data(details):
-            self._attr_available = True
-        else:
-            self._attr_available = False
+        self._attr_native_value = self._compute()
         super()._handle_coordinator_update()
 
-    def _find_plan(self, details):
-        """Find this plan in the API payload."""
-        for plan in details.get("plans", []):
-            if plan.get("index") == self._plan_index:
-                return plan
+    def _compute(self):
+        """Return the energy, or None when the counter is missing or unreadable.
+
+        None, never zero. A zero would read as a counter reset to Home Assistant's
+        statistics and cost a spurious cycle — the same reasoning that keeps this entity
+        from existing at all without a power.
+        """
+        system = self.coordinator.data.get(self.system_id)
+        if system is None:
+            return None
+        try:
+            seconds = float(system.details.settings[self._spec["source"]])
+        except (KeyError, TypeError, ValueError):
+            _LOGGER.debug(
+                "Cannot compute %s: %s is missing or unreadable",
+                self._key, self._spec["source"],
+            )
+            return None
+        return round(seconds * self._watts / self._spec["divisor"], 3)
+
+
+def _describe_alert_param(alert: KlereoAlert, details: KlereoPoolDetails) -> str | None:
+    """Return what this alert's `param` means, or None when nothing sources it.
+
+    🔴 `param` carries a different kind of identifier per code — a probe index, a flow id,
+    an output index, a pump id, an error code — so rendering it raw is wrong more often
+    than right. Codes with no documented meaning get no description rather than a
+    plausible one (`klereo.class.php` l.575-596).
+
+    Probe and output params resolve against what THIS installation actually reports, not
+    against a ported lookup table: upstream carries a fixed CapteurID→label map, and a
+    second source of truth for something we already parse is a drift waiting to happen.
+    An index that resolves to nothing falls back to the number.
+    """
+    code, param = alert.code, alert.param
+
+    if code == 5:
+        # Upstream ignores `param` entirely here — the alert is always about the RFID
+        # module, whatever it carries.
+        return "RFID"
+    if code == 6:
+        return ALERT_PARAM_CALIBRATION.get(param)
+    if param is None:
         return None
-
-    def _update_from_data(self, details) -> bool:
-        """Decode the plan and update state/attributes."""
-        plan = self._find_plan(details)
-        if not plan:
-            return False
-
-        decoded = decode_plan(self._plan_index, plan.get("plan64", ""))
-        if decoded is None:
-            return False
-
-        self._attr_native_value = schedule_text(decoded, self._plan_index)
-        attributes = {
-            "plan_index": self._plan_index,
-            "plan64": decoded.get("plan64"),
-            "raw_hex": decoded.get("raw_hex"),
-            "format": decoded.get("format"),
-            "slot_count": decoded.get("slot_count"),
-            "slot_minutes": decoded.get("slot_minutes"),
-            "active_slots": decoded.get("active_slots"),
-            "schedule": decoded.get("ranges", []),
-            "update_time": plan.get("updateTime"),
-        }
-
-        if self._plan_index == 254:
-            attributes["masks"] = decoded.get("masks", [])
-        else:
-            attributes["slots"] = decoded.get("slots", [])
-            if self._plan_index == PLAN_FILTRATION:
-                attributes["speed_1_slots"] = decoded.get("speed_1_slots")
-                attributes["speed_2_slots"] = decoded.get("speed_2_slots")
-
-        self._attr_extra_state_attributes = attributes
-        return True
+    if code in ALERT_PARAM_IS_PROBE:
+        probe = details.probe_index.get(param)
+        if probe is not None and probe.type in SENSOR_TYPES:
+            return SENSOR_TYPES[probe.type]["name"]
+        if probe is not None and probe.type in BINARY_SENSOR_TYPES:
+            return BINARY_SENSOR_TYPES[probe.type]["name"]
+        return f"sensor {param}"
+    if code in ALERT_PARAM_IS_OUTPUT:
+        return OUTPUT_NAMES.get(param, f"output {param}")
+    if code in ALERT_PARAM_IS_FLOW:
+        return f"flow {param}"
+    if code in ALERT_PARAM_IS_PUMP:
+        return f"pump {param}"
+    if code in ALERT_PARAM_IS_ERROR_CODE:
+        return f"error code {param}"
+    prefix = ALERT_PARAM_PREFIXES.get(code)
+    return f"{prefix} {param}" if prefix else None
 
 
-class KlereoAlertCountSensor(KlereoEntity, SensorEntity):
-    """Number of active alerts reported by the Klereo system."""
+def _render_alert(alert: KlereoAlert, details: KlereoPoolDetails) -> dict:
+    """Render one alert as the attribute dict an automation reads."""
+    label = ALERT_LABELS.get(alert.code)
+    detail = _describe_alert_param(alert, details)
+    if label is None:
+        # Upstream says "Code alerte inconnu par le plugin" rather than mapping to a
+        # neighbour. An alert we cannot name is still an alert worth counting and showing.
+        label = f"Unknown alert code {alert.code}"
+        detail = None
+    return {
+        "code": alert.code,
+        "label": f"{label} - {detail}" if detail else label,
+        "param": alert.param,
+        "level": alert.level,
+        "updated": alert.updated,
+    }
 
-    _attr_icon = "mdi:alert-circle-outline"
+
+class KlereoAlertSensor(KlereoEntity, SensorEntity):
+    """The pool's active Klereo alerts: how many, and which ones.
+
+    Requested in GitHub #57 and shaped by the reporter, who chose this over one
+    binary_sensor per code (~25 entities per pool) and over an event (no dashboard state):
+    *"It will allow me to trigger a notification on my phone when there is an alert and
+    see exactly what the alert is."* The upstream plugin, written independently, exposes
+    the same pair — an `alertCount` and an `alerts` text (`klereo.class.php` l.509-517).
+
+    🔴 The state is `len(alerts)`, NOT the API's `alertCount`. The only measured payload
+    carries `alertCount: 0` beside one active alert, so trusting that field would render a
+    healthy-looking `0` over a real alert — a false green, on the entity whose entire job
+    is to not be one. The reported figure is exposed as an attribute so the divergence
+    stays visible.
+    """
+
+    _attr_icon = "mdi:pool"
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator, system_id):
-        """Initialize the alert count sensor."""
+        """Initialize the alert sensor."""
         super().__init__(coordinator, system_id)
-        self._attr_unique_id = f"{system_id}_alert_count"
-        self._attr_name = "Active Alerts"
-        self._attr_native_unit_of_measurement = "alerts"
-        self._update_from_data(coordinator.data.get(system_id, {}).get("details", {}))
+        self._attr_unique_id = f"{system_id}_alerts"
+        self._attr_name = "Alerts"
+        self._apply()
+
+    def _apply(self) -> None:
+        """Read the current alerts off the coordinator into state and attributes."""
+        system = self._system()
+        if system is None:
+            return
+        details = system.details
+        rendered = [_render_alert(a, details) for a in details.alerts]
+        self._attr_native_value = len(rendered)
+        self._attr_extra_state_attributes = {
+            "alerts": rendered,
+            "codes": [a.code for a in details.alerts],
+            # Klereo's own figure, kept for comparison and never used as the state.
+            "reported_alert_count": details.reported_alert_count,
+        }
 
     @callback
     def _handle_coordinator_update(self):
         """Handle updated data from the coordinator."""
-        if self.system_id not in self.coordinator.data:
-            self._attr_available = False
-            return super()._handle_coordinator_update()
-        self._attr_available = True
-        details = self.coordinator.data[self.system_id].get("details", {})
-        self._update_from_data(details)
+        self._apply()
         super()._handle_coordinator_update()
-
-    def _update_from_data(self, details):
-        """Update state from the system's alert data."""
-        alerts = details.get("alerts", [])
-        self._attr_native_value = details.get("alertCount", len(alerts))
-        self._attr_extra_state_attributes = {
-            "notify_count": details.get("notifyCount"),
-            "alerts": alerts,
-        }

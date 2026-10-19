@@ -3,28 +3,58 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.klereo_perso.api import OUT_MODE_MAN, OUT_STATE_OFF, OUT_STATE_ON
-from custom_components.klereo_perso.switch import KlereoSwitch
+from custom_components.klereo_perso.api import (
+    HEAT_MODE_HEATING,
+    HEAT_MODE_STOP,
+    OUT_IDX_FILTRATION,
+    OUT_IDX_HEATING,
+    OUT_MODE_MAN,
+    OUT_MODE_REGUL,
+    OUT_MODE_TIME_SLOTS,
+    OUT_STATE_AUTO,
+    OUT_STATE_OFF,
+    OUT_STATE_ON,
+)
+from custom_components.klereo_perso.models import (
+    KlereoOutput,
+    KlereoPoolDetails,
+    KlereoSystemData,
+    KlereoSystemInfo,
+)
+from custom_components.klereo_perso.switch import KlereoSwitch, _extract_switches
+
+
+def _make_output(**kwargs) -> KlereoOutput:
+    """Create a KlereoOutput with defaults."""
+    defaults = {"index": 0, "status": 1, "mode": 0, "type": 0}
+    defaults.update(kwargs)
+    return KlereoOutput(**defaults)
 
 
 @pytest.fixture
 def mock_coordinator():
     """Create a mock coordinator."""
+    output = _make_output()
     coordinator = MagicMock()
+    # 🔴 Set EXPLICITLY. Left as a bare MagicMock attribute it is truthy but not `True`,
+    # so `assert entity.available is True` would pass for a reason that is not the one
+    # under test — `CoordinatorEntity.available` returns this value straight through.
+    coordinator.last_update_success = True
     coordinator.api = AsyncMock()
     coordinator.api.set_output.return_value = {"response": "ok"}
     coordinator.async_request_refresh = AsyncMock()
     coordinator.async_set_output = AsyncMock()
     coordinator.data = {
-        "SYS1": {
-            "info": {"idSystem": "SYS1", "poolNickname": "My Pool"},
-            "details": {
-                "outs": [{"index": 0, "status": 1, "mode": 0, "type": 0}],
-                "_output_index": {
-                    0: {"index": 0, "status": 1, "mode": 0, "type": 0},
-                },
-            },
-        }
+        "SYS1": KlereoSystemData(
+            info=KlereoSystemInfo(id_system="SYS1", pool_nickname="My Pool"),
+            details=KlereoPoolDetails(
+                probes=[],
+                outs=[output],
+                regul_modes={},
+                probe_index={},
+                output_index={0: output},
+            ),
+        )
     }
     return coordinator
 
@@ -34,44 +64,44 @@ class TestKlereoSwitch:
 
     def test_creates_with_known_index(self, mock_coordinator):
         """Should use OUTPUT_NAMES for known indices."""
-        output = {"index": 0, "status": 1, "mode": 0, "type": 0}
+        output = _make_output()
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_name == "Lighting"
         assert switch._attr_unique_id == "SYS1_output_0"
 
     def test_is_on_when_status_equals_one(self, mock_coordinator):
         """Should be ON when status == OUT_STATE_ON (1)."""
-        output = {"index": 0, "status": 1, "mode": 0, "type": 0}
+        output = _make_output(status=1)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_is_on is True
 
     def test_is_off_when_status_equals_zero(self, mock_coordinator):
         """Should be OFF when status == 0."""
-        output = {"index": 0, "status": 0, "mode": 0, "type": 0}
+        output = _make_output(status=0)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_is_on is False
 
     def test_is_on_when_status_is_string_one(self, mock_coordinator):
         """Should be ON when status is string '1' (API may return strings)."""
-        output = {"index": 0, "status": "1", "mode": 0, "type": 0}
+        output = _make_output(status="1")
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_is_on is True
 
     def test_is_off_when_status_is_string_zero(self, mock_coordinator):
         """Should be OFF when status is string '0'."""
-        output = {"index": 0, "status": "0", "mode": 0, "type": 0}
+        output = _make_output(status="0")
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_is_on is False
 
     def test_is_off_when_status_is_none(self, mock_coordinator):
         """Should be OFF when status is None."""
-        output = {"index": 0, "status": None, "mode": 0, "type": 0}
+        output = _make_output(status=None)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         assert switch._attr_is_on is False
 
     async def test_turn_on_calls_api(self, mock_coordinator):
         """turn_on should call async_set_output with correct args."""
-        output = {"index": 0, "status": 0, "mode": 0, "type": 0}
+        output = _make_output(status=0)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         switch.async_write_ha_state = MagicMock()
         await switch.async_turn_on()
@@ -82,7 +112,7 @@ class TestKlereoSwitch:
 
     async def test_turn_off_calls_api(self, mock_coordinator):
         """turn_off should call async_set_output with correct args."""
-        output = {"index": 0, "status": 1, "mode": 0, "type": 0}
+        output = _make_output(status=1)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         switch.async_write_ha_state = MagicMock()
         await switch.async_turn_off()
@@ -95,16 +125,398 @@ class TestKlereoSwitch:
         """turn_on should raise HomeAssistantError on coordinator failure."""
         from homeassistant.exceptions import HomeAssistantError
         mock_coordinator.async_set_output.side_effect = HomeAssistantError("Failed to set output 0: API down")
-        output = {"index": 0, "status": 0, "mode": 0, "type": 0}
+        output = _make_output(status=0)
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
         switch.async_write_ha_state = MagicMock()
         with pytest.raises(HomeAssistantError, match="Failed to set output"):
             await switch.async_turn_on()
 
-    def test_find_my_data_uses_index(self, mock_coordinator):
-        """Should find output data via _output_index."""
-        output = {"index": 0, "status": 1, "mode": 0, "type": 0}
+    def test_find_my_output_uses_index(self, mock_coordinator):
+        """Should find output data via output_index."""
+        output = _make_output()
         switch = KlereoSwitch(mock_coordinator, "SYS1", output)
-        found = switch._find_my_data()
+        found = switch._find_my_output()
         assert found is not None
-        assert found["status"] == 1
+        assert found.status == 1
+
+
+class TestKlereoHeatingSwitch:
+    """Output 4 carries the KlereoTherm mode in newMode, not the output mode.
+
+    Upstream: MrWaloo/jeedom-klereo core/class/klereo.class.php, _HEAT_MODE_*
+    at l.1377-1380 and the `elseif ($outIndex === 4)` branch at l.1525+.
+    Forgejo #55 / GitHub #58.
+    """
+
+    @pytest.fixture
+    def heating_coordinator(self, mock_coordinator):
+        """Swap the fixture's output for the heating one (index 4)."""
+        output = _make_output(index=OUT_IDX_HEATING, status=0, mode=0)
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {OUT_IDX_HEATING: output}
+        return mock_coordinator
+
+    async def test_turn_on_sends_heat_mode_not_manual(self, heating_coordinator):
+        """turn_on must send HEAT_MODE_HEATING, never OUT_MODE_MAN (= Off here).
+
+        The state paired with it is ON (1), not AUTO (2): measured on the official web
+        client on two installations (GitHub #55, Forgejo #166). The table lives in
+        `state_for_heat_mode` — this asserts what reaches the coordinator, so it fails if
+        this platform stops using it.
+        """
+        output = _make_output(index=OUT_IDX_HEATING, status=0, mode=0)
+        switch = KlereoSwitch(heating_coordinator, "SYS1", output)
+        switch.async_write_ha_state = MagicMock()
+        await switch.async_turn_on()
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_HEATING, OUT_STATE_ON
+        )
+        assert switch._attr_is_on is True
+
+    async def test_turn_off_sends_heat_mode_stop(self, heating_coordinator):
+        """turn_off must send HEAT_MODE_STOP/OFF."""
+        output = _make_output(index=OUT_IDX_HEATING, status=2, mode=3)
+        switch = KlereoSwitch(heating_coordinator, "SYS1", output)
+        switch.async_write_ha_state = MagicMock()
+        await switch.async_turn_off()
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_STOP, OUT_STATE_OFF
+        )
+        assert switch._attr_is_on is False
+
+    async def test_other_outputs_keep_manual_mode(self, mock_coordinator):
+        """Control: the generic branch is untouched — this is why the light works."""
+        output = _make_output(index=0, status=0)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        switch.async_write_ha_state = MagicMock()
+        await switch.async_turn_on()
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, OUT_MODE_MAN, OUT_STATE_ON
+        )
+
+    def test_is_on_when_heating_state_is_auto(self, heating_coordinator):
+        """status == 2 (AUTO) means the KlereoTherm is running, not off."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=3)
+        switch = KlereoSwitch(heating_coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_is_off_when_heating_state_is_off(self, heating_coordinator):
+        """status == 0 means stopped."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_OFF, mode=0)
+        switch = KlereoSwitch(heating_coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+
+class TestKlereoFiltrationSwitchUnderManualOnAFixedSpeedPump:
+    """A fixed-speed (or unconfirmed) Filtration pump keeps the ORIGINAL Manual reading.
+
+    An earlier draft made the switch read any non-zero Manual status as "on" for every
+    installation, to match `number.KlereoPumpSpeedNumber`. Reverted on request at the
+    time: the switch stayed exactly what it was before this feature existed — a plain
+    `status == OUT_STATE_ON` (1) check. That plain check is now scoped to a fixed-speed
+    (or unconfirmed) pump specifically — see `TestKlereoFiltrationSwitchUnderManualOnAConfirmedAnaloguePump`
+    below for the CONFIRMED-analogue-pump behaviour, which does follow the speed step
+    (review feedback: reading "off" at a running speed 2/3 misled a real dashboard).
+
+    `mock_coordinator` carries no `pump_max_speed` (`None`), so every test here is
+    already exercising the fixed-speed/unconfirmed case without needing to say so.
+    """
+
+    def test_is_off_at_speed_2_under_manual(self, mock_coordinator):
+        """Unlike ON (1), a speed step is not reflected by the switch under Manual."""
+        output = _make_output(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_MAN)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_is_on_at_plain_on_under_manual(self, mock_coordinator):
+        """Positive control: ordinary Manual ON/OFF is untouched by this output's specifics."""
+        output = _make_output(index=OUT_IDX_FILTRATION, status=OUT_STATE_ON, mode=OUT_MODE_MAN)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_is_off_at_zero_under_manual(self, mock_coordinator):
+        output = _make_output(index=OUT_IDX_FILTRATION, status=OUT_STATE_OFF, mode=OUT_MODE_MAN)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_status_2_under_time_slots_still_reads_as_off(self, mock_coordinator):
+        """🔴 Scope control: status 2 under Time Slots is still the generic AUTO flag.
+
+        Only Regulation and Manual are measured (see the two dedicated classes) — Time
+        Slots is a DIFFERENT mode nobody has measured on this hardware, and widening it
+        too would repeat the exact defect `_show_confirmed_output` already refuses for
+        every other output: turning the commanded AUTO into an invented relay reading.
+        """
+        output = _make_output(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_TIME_SLOTS)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_other_outputs_are_unaffected(self, mock_coordinator):
+        """Scope control: a non-Filtration output at status 2 still reads as off."""
+        output = _make_output(index=0, status=2, mode=OUT_MODE_MAN)
+        switch = KlereoSwitch(mock_coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+
+class TestKlereoFiltrationSwitchUnderManualOnAConfirmedAnaloguePump:
+    """✅ CONFIRMED (reporter's own dashboard, and the official Klereo app): on a
+    variable-speed pump, Manual at any speed step above 0 is the pump running, not
+    just step 1. Reading `status == OUT_STATE_ON` read speed 2/3 as off — the
+    reporter's own dashboard showed the switch off at a real, running speed 2, and the
+    official Klereo app agrees Filtration reads as running there.
+
+    🔴 This is the opposite direction from `TestKlereoFiltrationSwitchUnderManualOnAFixedSpeedPump`
+    above and deliberately does NOT change writing: `async_turn_on`/`async_turn_off`
+    still send plain Manual/On (speed 1) or Manual/Off — the slider
+    (`number.KlereoPumpSpeedNumber`) stays the only way to choose a step above 1.
+    """
+
+    def _put(self, mock_coordinator, output, pump_max_speed=3):
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {output.index: output}
+        details.pump_max_speed = pump_max_speed
+        return mock_coordinator
+
+    def test_is_on_at_speed_2_under_manual(self, mock_coordinator):
+        output = _make_output(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_is_on_at_speed_3_under_manual(self, mock_coordinator):
+        output = _make_output(index=OUT_IDX_FILTRATION, status=3, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_is_on_at_plain_speed_1_under_manual(self, mock_coordinator):
+        """Positive control: speed 1 (`OUT_STATE_ON`) was already read as on before this fix."""
+        output = _make_output(index=OUT_IDX_FILTRATION, status=OUT_STATE_ON, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_is_off_at_zero_under_manual(self, mock_coordinator):
+        output = _make_output(index=OUT_IDX_FILTRATION, status=OUT_STATE_OFF, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_a_fixed_speed_pump_still_reads_off_at_speed_2(self, mock_coordinator):
+        """Scope control: the SAME status=2 reads off when the pump isn't confirmed analogue."""
+        output = _make_output(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=None)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_other_outputs_are_unaffected(self, mock_coordinator):
+        """Scope control: a non-Filtration output at status 2 still reads as off, even
+        on a system with a confirmed analogue pump elsewhere."""
+        output = _make_output(index=0, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    async def test_turning_on_still_sends_plain_manual_on(self, mock_coordinator):
+        """Writing is unchanged: the switch never sends a speed step, only On/Off."""
+        output = _make_output(index=OUT_IDX_FILTRATION, status=OUT_STATE_OFF, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        switch.async_write_ha_state = MagicMock()
+
+        await switch.async_turn_on()
+
+        coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_FILTRATION, OUT_MODE_MAN, OUT_STATE_ON
+        )
+
+    async def test_turning_off_still_sends_plain_manual_off(self, mock_coordinator):
+        output = _make_output(index=OUT_IDX_FILTRATION, status=3, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        switch.async_write_ha_state = MagicMock()
+
+        await switch.async_turn_off()
+
+        coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_FILTRATION, OUT_MODE_MAN, OUT_STATE_OFF
+        )
+
+
+class TestKlereoFiltrationSwitchUnderRegulation:
+    """🔴 MEASURED on a real installation, across six diagnostics exports AND a Home
+    Assistant entity-history graph: on a CONFIRMED analogue pump (`pump_max_speed > 1`),
+    `status` does not reliably reflect the relay under Regulation, but `real_status` does
+    — including reaching 0 for a genuine stop, not just "the box decided" (the graph shows
+    a real dip to 0 mid-cycle, not a display artefact). See `models.KlereoOutput.real_status`.
+
+    🔴 An EARLIER draft approximated Regulation as always-on for every installation,
+    without checking `pump_max_speed`. Reverted on review: a fixed-speed pump whose
+    Regulation has genuinely stopped would have shown as running. Reading `real_status`
+    literally, gated on a CONFIRMED analogue pump, replaces that approximation — and an
+    installation that does not send `real_status` falls back to the same general
+    `status == OUT_STATE_ON` rule every other output/mode already uses, never to an
+    invented answer.
+    """
+
+    def _put(self, mock_coordinator, output, pump_max_speed):
+        """Point the shared fixture's system at this output and pump_max_speed."""
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {output.index: output}
+        details.pump_max_speed = pump_max_speed
+        return mock_coordinator
+
+    def test_reads_on_when_real_status_is_running(self, mock_coordinator):
+        output = _make_output(
+            index=OUT_IDX_FILTRATION, status=1, mode=OUT_MODE_REGUL, real_status=2
+        )
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is True
+
+    def test_reads_off_when_real_status_is_a_genuine_stop(self, mock_coordinator):
+        """🔴 THE behaviour the earlier "always on" draft could not express: a real 0
+        under Regulation (confirmed on the reporter's own entity-history graph) now
+        reads as off, not as a lie."""
+        output = _make_output(
+            index=OUT_IDX_FILTRATION, status=1, mode=OUT_MODE_REGUL, real_status=0
+        )
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_falls_back_to_the_general_rule_when_real_status_is_absent(self, mock_coordinator):
+        """An installation that does not send `real_status` must not be read as off (or
+        on) by invention — it falls back to the same rule every other case already uses."""
+        output = _make_output(
+            index=OUT_IDX_FILTRATION, status=1, mode=OUT_MODE_REGUL, real_status=None
+        )
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is True  # status == OUT_STATE_ON (1)
+
+    def test_a_fixed_speed_pump_ignores_real_status_and_keeps_the_original_rule(
+        self, mock_coordinator
+    ):
+        """🔴 THE fix requested on review: gated on `pump_max_speed > 1`. Without it, a
+        fixed-speed pump whose Regulation genuinely stopped (`status` and `real_status`
+        both 0 here) would have shown as running under the old "always on" draft."""
+        output = _make_output(
+            index=OUT_IDX_FILTRATION, status=0, mode=OUT_MODE_REGUL, real_status=0
+        )
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=None)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+    def test_other_outputs_under_regulation_are_unaffected(self, mock_coordinator):
+        """Scope control: the exception is specific to the Filtration output, even on a
+        system with a confirmed analogue pump. `real_status: 2` here WOULD read as on if
+        this output got the same treatment as Filtration — it must not."""
+        output = _make_output(index=2, status=OUT_STATE_AUTO, mode=OUT_MODE_REGUL, real_status=2)
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        switch = KlereoSwitch(coordinator, "SYS1", output)
+        assert switch._attr_is_on is False
+
+
+class TestProOutputsAreGatedOnAccess:
+    """Tests that outputs 2, 3, 8 and 15 stop being offered to accounts that cannot use them.
+
+    Klereo's documentation says `newMode` is "NON VALABLE POUR LES SORTIES 2,3,4,8,15".
+    1.5.3 handled output 4; the other four were never handled. Upstream does not try to
+    reinterpret `newMode` there either — it refuses to command them below professional
+    access (`klereo.class.php:1188`), which is the only defensible position while the
+    semantics on those outputs remain unknown.
+
+    Since #95 a write to one of them surfaces status 13 instead of failing silently, so
+    the user now sees errors on entities that should never have been offered.
+    """
+
+    def _details(self, access, indices=(0, 2, 3, 4, 8, 15)):
+        return KlereoPoolDetails(
+            outs=[_make_output(index=i) for i in indices],
+            access=access,
+        )
+
+    def _indices(self, coordinator, details):
+        return sorted(e._output_index for _, e in _extract_switches(coordinator, "SYS1", details))
+
+    def test_pro_outputs_are_dropped_below_professional_access(self, mock_coordinator):
+        """Should not offer 2, 3, 8 and 15 to an end-customer account."""
+        result = self._indices(mock_coordinator, self._details(access=10))
+        assert result == [0, 4]
+
+    def test_pro_outputs_are_kept_at_professional_access(self, mock_coordinator):
+        """Positive control: access 20 keeps every output.
+
+        Without this, "the entities are gone" would be compatible with a gate that removes
+        them for everyone — which would be a worse bug than the one being fixed.
+        """
+        result = self._indices(mock_coordinator, self._details(access=20))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_pro_outputs_are_kept_above_professional_access(self, mock_coordinator):
+        """Should compare on ordering, not equality — Klereo accounts are 25 and above."""
+        result = self._indices(mock_coordinator, self._details(access=25))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_an_unknown_access_never_gates(self, mock_coordinator):
+        """🔴 Should keep every output when `access` is absent from the payload.
+
+        `access` is optional (`models.py`), and "we do not know" must never remove an
+        entity a working installation already has. This mirrors `_is_offered` in
+        `number.py`, whose docstring states the same rule: only a value we can read, and
+        that says no, removes anything.
+        """
+        result = self._indices(mock_coordinator, self._details(access=None))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_ordinary_outputs_are_never_gated(self, mock_coordinator):
+        """Absurdity control: a read-only account keeps lighting, filtration and heating."""
+        details = self._details(access=5, indices=(0, 1, 4, 5))
+        assert self._indices(mock_coordinator, details) == [0, 1, 4, 5]
+
+
+class TestAvailabilityOfSwitch:
+    """Three witnesses on `.available`, and NEVER on `_attr_available` (#130).
+
+    `CoordinatorEntity.available` is a property returning `coordinator.last_update_success`,
+    and a property shadows `_attr_available` completely. Every assertion in this repository
+    used to read the attribute the code had just assigned, so it stayed green over a
+    mechanism that reported nothing — the same failure as #115, a second time.
+
+    Proof that the distinction is real, and not pedantry: before the fix, the three
+    `_attr_available is False` assertions reddened while the three `is True` ones stayed
+    green — because `_attr_available` defaults to `True`. They were passing for a reason
+    that had nothing to do with the code under test.
+    """
+
+    def _entity(self, mock_coordinator, system_id="SYS1"):
+        output = _make_output()
+        return KlereoSwitch(mock_coordinator, system_id, output)
+
+    def test_available_while_the_payload_carries_it(self, mock_coordinator):
+        """Positive control. Without it, "goes unavailable" is compatible with
+        "always unavailable", and every other arm here would pass on a broken entity."""
+        assert self._entity(mock_coordinator).available is True
+
+    def test_unavailable_when_the_system_disappears(self, mock_coordinator):
+        """A system absent from the payload takes its entities with it."""
+        assert self._entity(mock_coordinator, "MISSING").available is False
+
+    def test_unavailable_when_the_output_disappears(self, mock_coordinator):
+        """The narrower half: the system is still there, this output is not.
+
+        Distinct from the arm above on purpose — the base property only checks the system,
+        so a subclass that forgot to narrow it would pass that one and fail this.
+        """
+        entity = self._entity(mock_coordinator)
+        mock_coordinator.data["SYS1"].details.output_index.clear()
+        assert entity.available is False
+
+    def test_unavailable_when_the_refresh_fails(self, mock_coordinator):
+        """The half that already worked must survive: a failed refresh still bars."""
+        mock_coordinator.last_update_success = False
+        assert self._entity(mock_coordinator).available is False

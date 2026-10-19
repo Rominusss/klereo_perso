@@ -1,0 +1,665 @@
+"""Tests for Klereo select entities."""
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from custom_components.klereo_perso.api import (
+    HEAT_MODE_AUTO,
+    HEAT_MODE_COOLING,
+    HEAT_MODE_HEATING,
+    HEAT_MODE_STOP,
+    OUT_IDX_FILTRATION,
+    OUT_IDX_HEATING,
+    OUT_MODE_MAN,
+    OUT_MODE_TIME_SLOTS,
+    OUT_MODE_TIMER,
+    OUT_STATE_AUTO,
+    OUT_STATE_OFF,
+    OUT_STATE_ON,
+    OUTPUT_MODES,
+)
+from custom_components.klereo_perso.models import (
+    KlereoOutput,
+    KlereoPoolDetails,
+    KlereoSystemData,
+    KlereoSystemInfo,
+)
+from custom_components.klereo_perso.select import KlereoOutputModeSelect, _extract_selects
+
+
+def _make_output(**kwargs) -> KlereoOutput:
+    """Create a KlereoOutput with defaults."""
+    defaults = {"index": 0, "status": 1, "mode": 0, "type": 0}
+    defaults.update(kwargs)
+    return KlereoOutput(**defaults)
+
+
+@pytest.fixture
+def mock_coordinator():
+    """Create a mock coordinator."""
+    output = _make_output()
+    coordinator = MagicMock()
+    # 🔴 Set EXPLICITLY. Left as a bare MagicMock attribute it is truthy but not `True`,
+    # so `assert entity.available is True` would pass for a reason that is not the one
+    # under test — `CoordinatorEntity.available` returns this value straight through.
+    coordinator.last_update_success = True
+    coordinator.async_set_output = AsyncMock()
+    coordinator.data = {
+        "SYS1": KlereoSystemData(
+            info=KlereoSystemInfo(id_system="SYS1", pool_nickname="My Pool"),
+            details=KlereoPoolDetails(
+                probes=[],
+                outs=[output],
+                regul_modes={},
+                probe_index={},
+                output_index={0: output},
+            ),
+        )
+    }
+    return coordinator
+
+
+class TestKlereoOutputModeSelect:
+    """Tests for KlereoOutputModeSelect."""
+
+    def test_creates_with_known_index(self, mock_coordinator):
+        """Should use OUTPUT_NAMES for known indices with ' Mode' suffix."""
+        output = _make_output()
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert select._attr_name == "Lighting Mode"
+        assert select._attr_unique_id == "SYS1_output_mode_0"
+
+    def test_creates_with_unknown_index(self, mock_coordinator):
+        """Should fall back to 'Output N Mode' for unknown indices."""
+        output = _make_output(index=99)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert select._attr_name == "Output 99 Mode"
+
+    # `test_options_list` lived here and asserted exactly four options. It is superseded by
+    # `TestDocumentedOutputModes::test_exposes_every_writable_mode` (#105): Klereo
+    # documents eight writable modes, so "all four" was a statement about the integration's
+    # table, not about the API.
+
+    def test_current_option_manual(self, mock_coordinator):
+        """Should read 'Manual' from mode=0."""
+        output = _make_output(mode=0)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert select._attr_current_option == "Manual"
+
+    def test_current_option_timer(self, mock_coordinator):
+        """Should read 'Timer' from mode=2."""
+        output = _make_output(mode=2)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert select._attr_current_option == "Timer"
+
+    def test_current_option_string_mode(self, mock_coordinator):
+        """Should handle string mode values from API."""
+        output = _make_output(mode="3")
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert select._attr_current_option == "Regulation"
+
+    # `test_current_option_none_defaults_manual` lived here and asserted that a missing mode
+    # reads as "Manual". That was the defect of #105 written down as an expectation — an
+    # absent value rendered as a specific, plausible, wrong one. It is superseded by
+    # `TestDocumentedOutputModes::test_a_missing_mode_is_not_reported_as_manual`.
+
+    async def test_select_option_non_manual_sends_auto(self, mock_coordinator):
+        """Timer hands control to the box, so newState is AUTO, not the ON/OFF status."""
+        output = _make_output(status=1)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Timer")
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, OUT_MODE_TIMER, OUT_STATE_AUTO
+        )
+        assert select._attr_current_option == "Timer"
+
+    async def test_select_option_manual_preserves_off_state(self, mock_coordinator):
+        """Manual is the one mode that keeps the ON/OFF state."""
+        output = _make_output(status=0, mode=OUT_MODE_TIME_SLOTS)
+        # Update the coordinator data to match
+        mock_coordinator.data["SYS1"].details.output_index[0] = output
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Manual")
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, OUT_MODE_MAN, OUT_STATE_OFF
+        )
+
+    def test_handle_coordinator_update_refreshes(self, mock_coordinator):
+        """Should update current option from coordinator data."""
+        output = _make_output(mode=0)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        # Update the output in coordinator data
+        mock_coordinator.data["SYS1"].details.output_index[0] = _make_output(mode=3)
+        select._handle_coordinator_update()
+        assert select._attr_current_option == "Regulation"
+        assert select.available is True
+
+    def test_device_info(self, mock_coordinator):
+        """Should return device info from coordinator data."""
+        output = _make_output()
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        info = select.device_info
+        assert ("klereo_perso", "SYS1") in info["identifiers"]
+        assert info["name"] == "My Pool"
+
+    async def test_select_option_error_propagates(self, mock_coordinator):
+        """Should propagate HomeAssistantError from coordinator."""
+        from homeassistant.exceptions import HomeAssistantError
+        mock_coordinator.async_set_output.side_effect = HomeAssistantError("Failed to set output 0: API down")
+        output = _make_output(status=1)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        with pytest.raises(HomeAssistantError, match="Failed to set output"):
+            await select.async_select_option("Regulation")
+
+
+class TestDocumentedOutputModes:
+    """Tests the ten output modes Klereo's API documentation describes (#105).
+
+    `OUTPUT_MODES` carried four. The documentation (`docs/klereo-api.md`) lists ten, of
+    which two are marked *USAGE INTERNE — ne pas utiliser*. The upstream plugin, written
+    independently, validates exactly `{0,1,2,3,4,6,8,9}` for writes — the same ten minus
+    the same two (`klereo.class.php:1198`). That agreement is what makes this fixable
+    without hardware.
+
+    The defect was not a missing option: it was `self._modes[0]` as a fallback, which
+    reported any unknown mode as **Manual** — a plausible, wrong value indistinguishable
+    from an output genuinely in Manual.
+    """
+
+    def test_exposes_every_writable_mode(self, mock_coordinator):
+        """Should offer the eight modes Klereo accepts, in documented order."""
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output())
+        assert select._attr_options == [
+            "Manual",
+            "Time Slots",
+            "Timer",
+            "Regulation",
+            "Filtration Sync",
+            "Maintenance",
+            "Pulse",
+            "Automatic",
+        ]
+
+    def test_does_not_offer_the_internal_use_modes(self, mock_coordinator):
+        """Should never offer 5 or 7 — the documentation marks both 'ne pas utiliser'.
+
+        Offering them would let a user send a value Klereo documents as forbidden.
+        """
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output())
+        assert len(select._attr_options) == 8
+
+    @pytest.mark.parametrize(
+        ("mode", "label"),
+        [(4, "Filtration Sync"), (6, "Maintenance"), (8, "Pulse"), (9, "Automatic")],
+    )
+    def test_reads_the_modes_that_used_to_read_as_manual(self, mock_coordinator, mode, label):
+        """Should report the real mode for the four that fell through to Manual."""
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(mode=mode))
+        assert select._attr_current_option == label
+
+    @pytest.mark.parametrize("mode", [5, 7])
+    def test_an_internal_use_mode_is_not_reported_as_manual(self, mock_coordinator, mode):
+        """Should report nothing rather than Manual for a mode it cannot offer."""
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(mode=mode))
+        assert select._attr_current_option is None
+
+    def test_an_unknown_mode_is_not_reported_as_manual(self, mock_coordinator):
+        """Absurdity control: a mode absent from the documentation must not read as Manual.
+
+        The documentation is not guaranteed exhaustive, so this is the case that must keep
+        working after the table is widened — widening it is not what fixes the defect.
+        """
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(mode=99))
+        assert select._attr_current_option is None
+
+    def test_an_unreadable_mode_is_not_reported_as_manual(self, mock_coordinator):
+        """Should report nothing when the API sends a mode that will not parse as an int."""
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(mode="banana"))
+        assert select._attr_current_option is None
+
+    def test_a_missing_mode_is_not_reported_as_manual(self, mock_coordinator):
+        """Should report nothing when the API sends no mode at all.
+
+        Same defect as the others: 'we do not know' rendered as a specific, wrong answer.
+        """
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(mode=None))
+        assert select._attr_current_option is None
+
+    async def test_can_select_a_newly_exposed_mode(self, mock_coordinator):
+        """Should write mode 4 with AUTO state — only Manual carries an ON/OFF state."""
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output())
+        select.hass = MagicMock()
+        select.async_write_ha_state = MagicMock()
+
+        await select.async_select_option("Filtration Sync")
+
+        mock_coordinator.async_set_output.assert_awaited_once_with("SYS1", 0, 4, 2)
+
+    def test_the_heating_output_keeps_its_four_klereotherm_modes(self, mock_coordinator):
+        """Negative control on scope: widening the output table must not touch output 4.
+
+        Output 4 carries the KlereoTherm mode, and upstream validates `{0,1,2,3}` there on
+        the very same line that validates the eight elsewhere.
+        """
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(index=4))
+        assert select._attr_options == ["Off", "Auto", "Cooling", "Heating"]
+
+
+class TestKlereoHeatingModeSelect:
+    """Output 4's select must offer KlereoTherm modes, not output modes.
+
+    Upstream: klereo.class.php l.1377-1380 (_HEAT_MODE_*) and l.1525+
+    (`elseif ($outIndex === 4)`), where newState = newMode > 0 ? AUTO : OFF.
+    Forgejo #55 / GitHub #58.
+    """
+
+    @pytest.fixture
+    def heating_coordinator(self, mock_coordinator):
+        """Swap the fixture's output for the heating one (index 4)."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=HEAT_MODE_AUTO)
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {OUT_IDX_HEATING: output}
+        return mock_coordinator
+
+    def test_options_are_heat_modes(self, heating_coordinator):
+        """Manual/Time Slots/Timer/Regulation are meaningless on output 4."""
+        output = _make_output(index=OUT_IDX_HEATING, mode=HEAT_MODE_AUTO)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        assert select.options == ["Off", "Auto", "Cooling", "Heating"]
+
+    def test_current_option_reads_heat_mode(self, heating_coordinator):
+        """mode == 3 is Heating, not Regulation."""
+        output = _make_output(index=OUT_IDX_HEATING, mode=HEAT_MODE_HEATING)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        assert select._attr_current_option == "Heating"
+
+    async def test_select_heating_sends_the_on_state(self, heating_coordinator):
+        """🔴 Heating pairs with newState = ON (1) — measured, never the on/off status.
+
+        The reported status is deliberately not consulted here: this call leaves the pump
+        *stopped* (`status = OFF`), and the value sent must still be the one the target
+        mode decides (Forgejo #166).
+        """
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_OFF, mode=HEAT_MODE_STOP)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Heating")
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_HEATING, OUT_STATE_ON
+        )
+
+    async def test_select_auto_still_sends_the_auto_state(self, heating_coordinator):
+        """Control: the heating branch is a table, not a uniform flip to ON."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=HEAT_MODE_HEATING)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Auto")
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_AUTO, OUT_STATE_AUTO
+        )
+
+    async def test_select_cooling_is_unchanged_because_it_is_unmeasured(self, heating_coordinator):
+        """⚠️ Cooling keeps the value that shipped before the measurement. See test_api."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=HEAT_MODE_HEATING)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Cooling")
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_COOLING, OUT_STATE_AUTO
+        )
+
+    async def test_select_off_sends_off_state(self, heating_coordinator):
+        """Off pairs with newState = OFF (0)."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=HEAT_MODE_HEATING)
+        select = KlereoOutputModeSelect(heating_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Off")
+        heating_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_HEATING, HEAT_MODE_STOP, OUT_STATE_OFF
+        )
+
+    def test_other_outputs_keep_output_modes(self, mock_coordinator):
+        """Control: every other output still offers the output modes, not the heating ones.
+
+        Asserted on membership rather than on the full list: this test exists to prove the
+        two mode *families* stay apart, and #105 widened the output family from four to
+        eight. Pinning the whole list here would make it fail on every future addition for
+        a reason that has nothing to do with what it guards. The complete list is asserted
+        once, in `TestDocumentedOutputModes`.
+        """
+        output = _make_output(index=0, mode=0)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        assert "Manual" in select.options
+        assert "Regulation" in select.options
+        # "Off" and "Cooling" exist only in HEAT_MODES — their absence is the discriminator.
+        assert "Off" not in select.options
+        assert "Cooling" not in select.options
+
+
+class TestNonManualModesSendAutoState:
+    """Time Slots / Timer / Regulation pair with newState = AUTO on every output.
+
+    Upstream klereo.class.php l.1641-1655: only OUT_MODE_MAN carries the on/off
+    state; TIMER and TIME_SLOTS both send _OUT_STATE_AUTO. The filtration branch
+    (l.1500+) does the same for REGUL.
+    """
+
+    async def test_time_slots_sends_auto(self, mock_coordinator):
+        """Time Slots must send AUTO (2), not the preserved on/off status."""
+        output = _make_output(index=0, status=OUT_STATE_ON, mode=0)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Time Slots")
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, OUT_MODE_TIME_SLOTS, OUT_STATE_AUTO
+        )
+
+    async def test_regulation_sends_auto(self, mock_coordinator):
+        """Regulation must send AUTO (2) too."""
+        output = _make_output(index=1, status=OUT_STATE_OFF, mode=0)
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {1: output}
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Regulation")
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 1, 3, OUT_STATE_AUTO
+        )
+
+    async def test_manual_still_preserves_on_off(self, mock_coordinator):
+        """Control: Manual is the one mode that keeps the on/off state."""
+        output = _make_output(index=0, status=OUT_STATE_ON, mode=OUT_MODE_TIMER)
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        await select.async_select_option("Manual")
+        mock_coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, 0, OUT_STATE_ON
+        )
+
+
+class TestProOutputsAreGatedOnAccess:
+    """Tests that outputs 2, 3, 8 and 15 stop being offered to accounts that cannot use them.
+
+    Klereo's documentation says `newMode` is "NON VALABLE POUR LES SORTIES 2,3,4,8,15".
+    1.5.3 handled output 4; the other four were never handled. Upstream does not try to
+    reinterpret `newMode` there either — it refuses to command them below professional
+    access (`klereo.class.php:1188`), which is the only defensible position while the
+    semantics on those outputs remain unknown.
+
+    Since #95 a write to one of them surfaces status 13 instead of failing silently, so
+    the user now sees errors on entities that should never have been offered.
+    """
+
+    def _details(self, access, indices=(0, 2, 3, 4, 8, 15)):
+        return KlereoPoolDetails(
+            outs=[_make_output(index=i) for i in indices],
+            access=access,
+        )
+
+    def _indices(self, coordinator, details):
+        return sorted(e._output_index for _, e in _extract_selects(coordinator, "SYS1", details))
+
+    def test_pro_outputs_are_dropped_below_professional_access(self, mock_coordinator):
+        """Should not offer 2, 3, 8 and 15 to an end-customer account."""
+        result = self._indices(mock_coordinator, self._details(access=10))
+        assert result == [0, 4]
+
+    def test_pro_outputs_are_kept_at_professional_access(self, mock_coordinator):
+        """Positive control: access 20 keeps every output.
+
+        Without this, "the entities are gone" would be compatible with a gate that removes
+        them for everyone — which would be a worse bug than the one being fixed.
+        """
+        result = self._indices(mock_coordinator, self._details(access=20))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_pro_outputs_are_kept_above_professional_access(self, mock_coordinator):
+        """Should compare on ordering, not equality — Klereo accounts are 25 and above."""
+        result = self._indices(mock_coordinator, self._details(access=25))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_an_unknown_access_never_gates(self, mock_coordinator):
+        """🔴 Should keep every output when `access` is absent from the payload.
+
+        `access` is optional (`models.py`), and "we do not know" must never remove an
+        entity a working installation already has. This mirrors `_is_offered` in
+        `number.py`, whose docstring states the same rule: only a value we can read, and
+        that says no, removes anything.
+        """
+        result = self._indices(mock_coordinator, self._details(access=None))
+        assert result == [0, 2, 3, 4, 8, 15]
+
+    def test_ordinary_outputs_are_never_gated(self, mock_coordinator):
+        """Absurdity control: a read-only account keeps lighting, filtration and heating."""
+        details = self._details(access=5, indices=(0, 1, 4, 5))
+        assert self._indices(mock_coordinator, details) == [0, 1, 4, 5]
+
+
+class TestCoolingModesAreGatedOnHeaterType:
+    """Output 4 must only offer Auto and Cooling to hardware that can do them.
+
+    Upstream builds the list from the heating TYPE (`klereo.class.php` l.929):
+
+        '0|Arrêt' . (in_array($HeaterMode, [2, 4]) ? ';1|Automatique;2|Refroidissement' : '')
+                  . ';3|Chauffage'
+
+    `HeaterMode` 2 (KlereoTherm heat pump) and 4 (other heat pump) can run automatically
+    and cool. 0 (no heat pump), 1 (heat pump or on/off heater) and 3 (on/off heating, no
+    setpoint) can only heat or stop — and Bioul's installation is a 1, which is why
+    "Cooling" is offered today to hardware that does not cool.
+
+    🔴 The gate is written as a positive list of the types KNOWN to be heat-only, not as
+    upstream's "everything that is not 2 or 4". The two differ exactly on a value we
+    cannot read — absent, unparseable, or an integer Klereo has not documented — and
+    "unknown never bars" (#94, #104) bites the other way round here: narrowing on a
+    missing reading would DELETE a control that works today, while the defect being fixed
+    is benign (an inert option). Forgejo #124.
+    """
+
+    def _coordinator(self, mock_coordinator, settings=None, container="params"):
+        """Point the fixture at output 4 and put `settings` in one of the containers."""
+        output = _make_output(index=OUT_IDX_HEATING, status=OUT_STATE_AUTO, mode=HEAT_MODE_AUTO)
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {OUT_IDX_HEATING: output}
+        setattr(details, container, settings or {})
+        return mock_coordinator
+
+    def _options(self, mock_coordinator, settings=None, container="params"):
+        coordinator = self._coordinator(mock_coordinator, settings, container)
+        output = coordinator.data["SYS1"].details.output_index[OUT_IDX_HEATING]
+        return KlereoOutputModeSelect(coordinator, "SYS1", output).options
+
+    @pytest.mark.parametrize("heater_mode", [2, 4])
+    def test_a_real_heat_pump_keeps_all_four_modes(self, mock_coordinator, heater_mode):
+        """Positive control: types 2 and 4 are the ones that CAN cool.
+
+        Without this arm, "the list shrank" would be compatible with a gate that shrinks
+        it for everybody — which would be worse than the bug being fixed.
+        """
+        options = self._options(mock_coordinator, {"HeaterMode": heater_mode})
+        assert options == ["Off", "Auto", "Cooling", "Heating"]
+
+    @pytest.mark.parametrize("heater_mode", [0, 1, 3])
+    def test_a_heat_only_type_is_not_offered_auto_or_cooling(self, mock_coordinator, heater_mode):
+        """🔴 The reported defect: type 1 is Bioul's, and it cannot cool."""
+        options = self._options(mock_coordinator, {"HeaterMode": heater_mode})
+        assert options == ["Off", "Heating"]
+
+    def test_a_missing_heater_mode_never_bars(self, mock_coordinator):
+        """🔴 A payload carrying no `HeaterMode` keeps the four modes it has today."""
+        options = self._options(mock_coordinator, {})
+        assert options == ["Off", "Auto", "Cooling", "Heating"]
+
+    @pytest.mark.parametrize("heater_mode", [7, "1", None, "", [], 2.0])
+    def test_an_unreadable_heater_mode_never_bars(self, mock_coordinator, heater_mode):
+        """🔴 An undocumented or unparseable value is "unknown", not "heat-only".
+
+        This is where the gate deliberately departs from upstream's `not in [2, 4]`:
+        an integer Klereo has never documented tells us nothing about the hardware, and
+        over-filtering is the dangerous direction.
+        """
+        options = self._options(mock_coordinator, {"HeaterMode": heater_mode})
+        assert options == ["Off", "Auto", "Cooling", "Heating"]
+
+    def test_the_heater_mode_is_read_from_any_container(self, mock_coordinator):
+        """Should read `HeaterMode` through `settings`, not out of `params` alone.
+
+        Three containers carry these keys and all three were seen in one response
+        (GitHub #57, 2026-08-26). `number.py` already reads the merged view; reading
+        `params` alone here would gate on one install and not on its neighbour.
+        """
+        for container in ("regul_modes", "extra_params"):
+            options = self._options(mock_coordinator, {"HeaterMode": 1}, container=container)
+            assert options == ["Off", "Heating"], container
+
+    def test_the_gate_re_evaluates_on_a_later_payload(self, mock_coordinator):
+        """A `HeaterMode` that arrives after discovery must still narrow the list.
+
+        The entity is created once and never re-created, so a gate computed only in
+        `__init__` would keep the four modes for the lifetime of the install.
+        """
+        coordinator = self._coordinator(mock_coordinator, {})
+        output = coordinator.data["SYS1"].details.output_index[OUT_IDX_HEATING]
+        select = KlereoOutputModeSelect(coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+        assert select.options == ["Off", "Auto", "Cooling", "Heating"]
+
+        coordinator.data["SYS1"].details.params = {"HeaterMode": 1}
+        select._handle_coordinator_update()
+        assert select.options == ["Off", "Heating"]
+
+    def test_offering_is_narrowed_but_reading_is_not(self, mock_coordinator):
+        """A heat-only type still REPORTING Cooling must be shown as Cooling.
+
+        Refusing to read a mode we chose not to offer would turn "our gate is wrong on
+        this install" into "unknown" — the #105 failure, one level up. The reported value
+        is evidence; hiding it costs the only signal that the gate is mis-typed.
+        """
+        coordinator = self._coordinator(mock_coordinator, {"HeaterMode": 1})
+        output = _make_output(index=OUT_IDX_HEATING, mode=HEAT_MODE_COOLING)
+        coordinator.data["SYS1"].details.output_index[OUT_IDX_HEATING] = output
+        select = KlereoOutputModeSelect(coordinator, "SYS1", output)
+        assert select._attr_current_option == "Cooling"
+        assert "Cooling" not in select.options
+
+    def test_ordinary_outputs_are_never_gated_on_the_heater_type(self, mock_coordinator):
+        """Scope control: `HeaterMode` says nothing about outputs other than 4."""
+        details = mock_coordinator.data["SYS1"].details
+        details.params = {"HeaterMode": 1}
+        select = KlereoOutputModeSelect(mock_coordinator, "SYS1", _make_output(index=0))
+        assert select.options == list(OUTPUT_MODES.values())
+
+
+class TestAvailabilityOfSelect:
+    """Three witnesses on `.available`, and NEVER on `_attr_available` (#130).
+
+    `CoordinatorEntity.available` is a property returning `coordinator.last_update_success`,
+    and a property shadows `_attr_available` completely. Every assertion in this repository
+    used to read the attribute the code had just assigned, so it stayed green over a
+    mechanism that reported nothing — the same failure as #115, a second time.
+
+    Proof that the distinction is real, and not pedantry: before the fix, the three
+    `_attr_available is False` assertions reddened while the three `is True` ones stayed
+    green — because `_attr_available` defaults to `True`. They were passing for a reason
+    that had nothing to do with the code under test.
+    """
+
+    def _entity(self, mock_coordinator, system_id="SYS1"):
+        output = _make_output()
+        return KlereoOutputModeSelect(mock_coordinator, system_id, output)
+
+    def test_available_while_the_payload_carries_it(self, mock_coordinator):
+        """Positive control. Without it, "goes unavailable" is compatible with
+        "always unavailable", and every other arm here would pass on a broken entity."""
+        assert self._entity(mock_coordinator).available is True
+
+    def test_unavailable_when_the_system_disappears(self, mock_coordinator):
+        """A system absent from the payload takes its entities with it."""
+        assert self._entity(mock_coordinator, "MISSING").available is False
+
+    def test_unavailable_when_the_output_disappears(self, mock_coordinator):
+        """The narrower half: the system is still there, this output is not.
+
+        Distinct from the arm above on purpose — the base property only checks the system,
+        so a subclass that forgot to narrow it would pass that one and fail this.
+        """
+        entity = self._entity(mock_coordinator)
+        mock_coordinator.data["SYS1"].details.output_index.clear()
+        assert entity.available is False
+
+    def test_unavailable_when_the_refresh_fails(self, mock_coordinator):
+        """The half that already worked must survive: a failed refresh still bars."""
+        mock_coordinator.last_update_success = False
+        assert self._entity(mock_coordinator).available is False
+
+
+class TestManualModePreservesPumpSpeedOnOutput1:
+    """The generic Output Mode select must not reset a running pump to Off.
+
+    `KlereoOutputModeSelect._state_for_mode` used to binarize any non-`OUT_STATE_ON`
+    status to OFF when returning to Manual — harmless everywhere a Manual state is only
+    ever 0 or 1, but on output 1, where a CONFIRMED analogue pump's Manual status can be
+    any speed step up to its own `PumpMaxSpeed` (`number.KlereoPumpSpeedNumber`), it would
+    silently drop a running pump to Off the moment a user (or another select) left and
+    re-entered Manual.
+
+    🔴 Gated on `pump_max_speed > 1` (review feedback): without it, a FIXED-speed pump
+    whose `status` happened to read 2 would have sent `newState=2` where it sends 0 today
+    — see `test_a_fixed_speed_pump_still_binarizes_to_on_off` below.
+    """
+
+    def _put(self, mock_coordinator, output, pump_max_speed):
+        details = mock_coordinator.data["SYS1"].details
+        details.outs = [output]
+        details.output_index = {output.index: output}
+        details.pump_max_speed = pump_max_speed
+        return mock_coordinator
+
+    async def test_manual_preserves_a_speed_step_instead_of_binarizing_to_off(self, mock_coordinator):
+        """Re-selecting Manual while status already reads a speed step must resend it."""
+        output = KlereoOutput(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        select = KlereoOutputModeSelect(coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+
+        await select.async_select_option("Manual")
+
+        coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_FILTRATION, OUT_MODE_MAN, 2
+        )
+
+    async def test_a_fixed_speed_pump_still_binarizes_to_on_off(self, mock_coordinator):
+        """🔴 THE fix requested on review: `pump_max_speed` absent (or `<= 1`) means this
+        is not a confirmed analogue pump, so output 1 keeps the ORIGINAL ON/OFF-only rule
+        — a stray `status == 2` must not become `newState=2` on a fixed-speed pump."""
+        output = KlereoOutput(index=OUT_IDX_FILTRATION, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=None)
+        select = KlereoOutputModeSelect(coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+
+        await select.async_select_option("Manual")
+
+        coordinator.async_set_output.assert_called_once_with(
+            "SYS1", OUT_IDX_FILTRATION, OUT_MODE_MAN, OUT_STATE_OFF
+        )
+
+    async def test_other_outputs_still_binarize_to_on_off(self, mock_coordinator):
+        """Control: the preservation is scoped to output 1 alone — even on a system with
+        a confirmed analogue pump, a different output keeps binarizing."""
+        output = KlereoOutput(index=0, status=2, mode=OUT_MODE_MAN)
+        coordinator = self._put(mock_coordinator, output, pump_max_speed=3)
+        select = KlereoOutputModeSelect(coordinator, "SYS1", output)
+        select.async_write_ha_state = MagicMock()
+
+        await select.async_select_option("Manual")
+
+        coordinator.async_set_output.assert_called_once_with(
+            "SYS1", 0, OUT_MODE_MAN, OUT_STATE_OFF
+        )
