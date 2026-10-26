@@ -346,7 +346,7 @@ class KlereoSchedulePlanSensor(KlereoEntity, SensorEntity):
         if plan_index == PLAN_ECREMAGE:
             return "Skimming Schedule"
         if plan_index == 254:
-            return "Plan 254 (3 Masks)"
+            return "Filtration Time Slots"
         return f"Plan {plan_index}"
 
     @property
@@ -392,13 +392,13 @@ class KlereoSchedulePlanSensor(KlereoEntity, SensorEntity):
             "update_time": plan.get("updateTime"),
         }
 
+        attributes["slots"] = decoded.get("slots", [])
+        if self._plan_index in (PLAN_FILTRATION, 254):
+            attributes["speed_1_slots"] = decoded.get("speed_1_slots")
+            attributes["speed_2_slots"] = decoded.get("speed_2_slots")
         if self._plan_index == 254:
-            attributes["masks"] = decoded.get("masks", [])
-        else:
-            attributes["slots"] = decoded.get("slots", [])
-            if self._plan_index == PLAN_FILTRATION:
-                attributes["speed_1_slots"] = decoded.get("speed_1_slots")
-                attributes["speed_2_slots"] = decoded.get("speed_2_slots")
+            attributes["speed_3_slots"] = decoded.get("speed_3_slots")
+            attributes["schedule_wrapped"] = decoded.get("wrapped_ranges", [])
 
         self._attr_extra_state_attributes = attributes
         self._available_plan = True

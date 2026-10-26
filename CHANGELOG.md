@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] — 2026-10-26
+
+### Fixed
+
+- Plan 254 (time-slot filtration schedule) was decoded as three independent 96-bit masks. It is
+  actually 96 slots x 3 bits (the value is the filtration speed). It now reads e.g.
+  `V1 23:15-07:00 | OFF 07:00-23:15`, matching the Klereo app. Sensor renamed
+  "Filtration Time Slots"; `unique_id` (`*_plan_254`) and entity_id are unchanged.
+
 ## [2.0.0] — 2026-10-19
 
 **Rebased on upstream [JonBasse/ha-klereo](https://github.com/JonBasse/ha-klereo) v1.20.0.**

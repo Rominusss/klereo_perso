@@ -177,3 +177,33 @@ def test_no_perso_entities_without_their_source_data():
     coord.data[SYS].info.raw.clear()
     uids = _uids(extract_perso_sensors(coord, SYS))
     assert not any("_plan_" in u or "_paraminfo_" in u for u in uids)
+
+
+# --- plan 254: time-slot filtration, 96 slots x 3 bits (real payload, official app: V1 23:15-07:00)
+PLAN254 = "SZIkSZIkSZIkSQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAk"
+
+
+def test_plan_254_decodes_as_96_slots_of_3_bits_speed_1_overnight():
+    from custom_components.klereo_perso.schedule import decode_plan, schedule_text
+
+    decoded = decode_plan(254, PLAN254)
+    assert decoded["format"] == "96x3-bit-speed"
+    assert decoded["slots"][:28] == [1] * 28
+    assert decoded["slots"][28:93] == [0] * 65
+    assert decoded["slots"][93:] == [1] * 3
+    assert decoded["speed_1_slots"] == 31
+    assert decoded["speed_2_slots"] == 0
+    # 23:15 -> 07:00 is ONE run across midnight, as the Klereo app shows it
+    assert schedule_text(decoded, 254) == "V1 23:15-07:00 | OFF 07:00-23:15"
+
+
+def test_plan_254_sensor_name_state_and_stable_unique_id():
+    coord = _coordinator()
+    coord.data[SYS].details.raw["plans"] = [{"index": 254, "plan64": PLAN254, "updateTime": 1}]
+    items = dict(extract_perso_sensors(coord, SYS))
+    sensor = items[f"{SYS}_plan_254"]
+    assert sensor.unique_id == f"{SYS}_plan_254"  # unchanged: the entity_id survives
+    assert sensor.name == "Filtration Time Slots"
+    assert sensor.native_value == "V1 23:15-07:00 | OFF 07:00-23:15"
+    assert sensor.extra_state_attributes["speed_1_slots"] == 31
+    assert sensor.extra_state_attributes["schedule_wrapped"][0]["start"] == "23:15"

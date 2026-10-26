@@ -71,33 +71,49 @@ def _decode_12_bytes(raw: bytes, index: int) -> dict[str, Any]:
 
 
 def _decode_254(raw: bytes) -> dict[str, Any]:
-    """Decode plan 254 as its three independent 96-bit masks.
+    """Decode plan 254: the time-slot filtration plan.
 
-    The API payload contains 36 bytes. The semantics of the three masks are
-    not identified by the API, so they are intentionally exposed as mask_0,
-    mask_1 and mask_2 rather than assigning undocumented names.
+    The payload is 36 bytes = 96 slots x 3 bits (little-endian bit stream, LSB first in
+    each byte). The 3-bit value of a slot is the filtration speed: 0 = off, 1 = speed 1,
+    2 = speed 2, ... Verified against the official Klereo app (speed 1 from 23:15 to 07:00
+    decodes to slots 0-27 and 93-95 = 1). An earlier version of this decoder read the
+    payload as three independent 96-bit masks, which is wrong.
     """
-    masks = []
-    for mask_index in range(3):
-        mask_raw = raw[mask_index * 12 : (mask_index + 1) * 12]
-        bits = [(byte >> bit) & 1 for byte in mask_raw for bit in range(8)]
-        masks.append(
-            {
-                "mask_index": mask_index,
-                "slots": bits,
-                "ranges": _ranges(bits),
-                "active_slots": sum(bits),
-                "raw_hex": mask_raw.hex(" "),
-            }
-        )
-
+    bits = [(byte >> bit) & 1 for byte in raw for bit in range(8)]
+    values = [
+        bits[3 * i] | (bits[3 * i + 1] << 1) | (bits[3 * i + 2] << 2)
+        for i in range(SLOT_COUNT)
+    ]
     return {
-        "format": "3x96-bit-masks",
+        "format": "96x3-bit-speed",
         "slot_count": SLOT_COUNT,
         "slot_minutes": SLOT_MINUTES,
-        "masks": masks,
-        "active_slots": sum(mask["active_slots"] for mask in masks),
+        "slots": values,
+        "ranges": _ranges(values),
+        "wrapped_ranges": _wrap_ranges(_ranges(values)),
+        "active_slots": sum(1 for value in values if value),
+        "speed_1_slots": values.count(1),
+        "speed_2_slots": values.count(2),
+        "speed_3_slots": values.count(3),
     }
+
+
+def _wrap_ranges(ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge the last and first range when they are the same value across midnight.
+
+    23:15-00:00 followed by 00:00-07:00 is one 23:15-07:00 run to a human.
+    """
+    if len(ranges) < 2 or ranges[0]["value"] != ranges[-1]["value"]:
+        return ranges
+    first, last = ranges[0], ranges[-1]
+    merged = {
+        "start": last["start"],
+        "end": first["end"],
+        "value": first["value"],
+        "start_slot": last["start_slot"],
+        "end_slot_exclusive": first["end_slot_exclusive"],
+    }
+    return [merged, *ranges[1:-1]]
 
 
 def decode_plan(index: int, plan64: str) -> dict[str, Any] | None:
@@ -133,18 +149,14 @@ def decode_plan(index: int, plan64: str) -> dict[str, Any] | None:
 
 def schedule_text(decoded: dict[str, Any], index: int) -> str:
     """Create a compact human-readable representation for an HA state."""
-    if index == 254:
-        return " | ".join(
-            f"Mask {mask['mask_index']}: {mask['active_slots']} active slots"
-            for mask in decoded.get("masks", [])
-        )
-
-    labels = decoded.get("ranges", [])
+    labels = decoded.get("wrapped_ranges") or decoded.get("ranges", [])
     if not labels:
         return ""
 
     if index == PLAN_FILTRATION:
         value_labels = {1: "V1", 2: "V2"}
+    elif index == 254:
+        value_labels = {0: "OFF", 1: "V1", 2: "V2", 3: "V3"}
     elif index == PLAN_ECREMAGE:
         value_labels = {0: "OFF", 1: "ON"}
     else:
