@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.2] — 2026-10-26
+
+### Fixed
+
+- Plan 254 labelled speed 4 (and above) as a bare number instead of `V4`. Every speed is now
+  `V1`…`V7`; added `speed_4_slots` and `speed_slots` attributes.
+
 ## [2.0.1] — 2026-10-26
 
 ### Fixed

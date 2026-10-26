@@ -95,6 +95,8 @@ def _decode_254(raw: bytes) -> dict[str, Any]:
         "speed_1_slots": values.count(1),
         "speed_2_slots": values.count(2),
         "speed_3_slots": values.count(3),
+        "speed_4_slots": values.count(4),
+        "speed_slots": {n: values.count(n) for n in range(1, 8) if n in values},
     }
 
 
@@ -156,7 +158,8 @@ def schedule_text(decoded: dict[str, Any], index: int) -> str:
     if index == PLAN_FILTRATION:
         value_labels = {1: "V1", 2: "V2"}
     elif index == 254:
-        value_labels = {0: "OFF", 1: "V1", 2: "V2", 3: "V3"}
+        # Speed 0 = off, any other value is a filtration speed (V1..V7, 3 bits).
+        value_labels = {0: "OFF", **{n: f"V{n}" for n in range(1, 8)}}
     elif index == PLAN_ECREMAGE:
         value_labels = {0: "OFF", 1: "ON"}
     else:

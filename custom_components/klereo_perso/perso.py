@@ -398,6 +398,8 @@ class KlereoSchedulePlanSensor(KlereoEntity, SensorEntity):
             attributes["speed_2_slots"] = decoded.get("speed_2_slots")
         if self._plan_index == 254:
             attributes["speed_3_slots"] = decoded.get("speed_3_slots")
+            attributes["speed_4_slots"] = decoded.get("speed_4_slots")
+            attributes["speed_slots"] = decoded.get("speed_slots")
             attributes["schedule_wrapped"] = decoded.get("wrapped_ranges", [])
 
         self._attr_extra_state_attributes = attributes

@@ -207,3 +207,15 @@ def test_plan_254_sensor_name_state_and_stable_unique_id():
     assert sensor.native_value == "V1 23:15-07:00 | OFF 07:00-23:15"
     assert sensor.extra_state_attributes["speed_1_slots"] == 31
     assert sensor.extra_state_attributes["schedule_wrapped"][0]["start"] == "23:15"
+
+
+def test_plan_254_labels_every_speed_up_to_v4_from_the_real_payload():
+    from custom_components.klereo_perso.schedule import decode_plan, schedule_text
+
+    decoded = decode_plan(254, "SZIkSZIliRImSQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAk")
+    assert schedule_text(decoded, 254) == (
+        "V1 23:15-03:15 | V3 03:15-03:30 | V1 03:30-04:30 | V2 04:30-04:45 | "
+        "V1 04:45-05:15 | V4 05:15-05:30 | V1 05:30-07:00 | OFF 07:00-23:15"
+    )
+    assert decoded["speed_4_slots"] == 1
+    assert decoded["speed_slots"] == {1: 28, 2: 1, 3: 1, 4: 1}
